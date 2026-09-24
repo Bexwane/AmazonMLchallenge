@@ -1,0 +1,18 @@
+{
+  "updated": "2026-09-25T01:05",
+  "phase": "T0 autopsy done; baseline pipeline built; awaiting first full-density run",
+  "official_metric": "macro F0.5 per Source-1 entity (singletons included)",
+  "best_cv": {"value": 0.9887, "exp": "20260925-dev-lgb-v1c", "note": "1% universe, optimistic"},
+  "best_stress_cv": {"holdout_India": 0.9787, "holdout_US": 0.9904},
+  "best_public_lb": null,
+  "champion": null,
+  "candidate": "20260925-E001-lgb-v1 (full data, not yet run)",
+  "compute": {"local": "i5-10210U, 16 GB RAM (~2.4 GB free), MX130 2 GB: smoke tests only",
+              "team": ["MacBook M2 Pro", "Kaggle free (30 GB RAM, 4 CPU, 12 h)", "Colab free (~12 GB RAM)"]},
+  "critical_risks": [
+    "full-density blocking recall unknown (dev 99.3% at 41 pairs/S1)",
+    "France unseen in train; stress-CV proxy only",
+    "test has 5.76 S2+S3 per S1 vs 4.68 in train: possible precision drop",
+    "submission count limits and deadline not yet confirmed"
+  ]
+}

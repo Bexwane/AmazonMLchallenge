@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+artifacts/
+output/
+*.parquet
+*.npz
+*.npy
+.ipynb_checkpoints/

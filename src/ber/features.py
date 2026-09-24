@@ -1,0 +1,105 @@
+"""Pairwise features for (Source-1, S2/S3) candidate pairs.
+
+Deliberately excludes `country` so the model transfers to countries absent from training
+(France in test). Context features (ranks within a Source-1 record's candidates and within a
+S2/S3 record's competing Source-1 records) carry most of the precision signal.
+"""
+import numpy as np
+import pandas as pd
+from rapidfuzz import fuzz
+from rapidfuzz.distance import JaroWinkler
+from rapidfuzz.process import cpdist
+
+
+def _sim(a, b, scorer, workers):
+    return cpdist(a, b, scorer=scorer, workers=workers, dtype=np.float32) / 100.0
+
+
+def _num_features(n1, n2):
+    """Jaccard of number sets, first-number equality, and presence flags."""
+    jac = np.zeros(len(n1), np.float32)
+    first_eq = np.zeros(len(n1), np.float32)
+    for i, (a, b) in enumerate(zip(n1, n2)):
+        if a and b:
+            sa, sb = a.split(), b.split()
+            A, B = set(sa), set(sb)
+            jac[i] = len(A & B) / len(A | B)
+            first_eq[i] = sa[0] == sb[0] or sa[0] in B
+    return jac, first_eq
+
+
+def _group_rank(values, groups, ascending=False):
+    s = pd.Series(values if ascending else -values)
+    return s.groupby(groups).rank(method="min").to_numpy(np.float32)
+
+
+def string_features(cand: pd.DataFrame, s1: pd.DataFrame, s23: pd.DataFrame, workers=-1, chunk=2_000_000) -> pd.DataFrame:
+    """Name/address similarity features for every row of `cand` (index is preserved)."""
+    parts = []
+    for start in range(0, len(cand), chunk):
+        c = cand.iloc[start:start + chunk]
+        L = s1.iloc[c["s1_idx"].to_numpy()].reset_index(drop=True)
+        R = s23.iloc[c["r_idx"].to_numpy()].reset_index(drop=True)
+        f = {}
+        ln, rn = L["name_core"].tolist(), R["name_core"].tolist()
+        f["n_ratio"] = _sim(ln, rn, fuzz.ratio, workers)
+        f["n_tset"] = _sim(ln, rn, fuzz.token_set_ratio, workers)
+        f["n_tsort"] = _sim(ln, rn, fuzz.token_sort_ratio, workers)
+        f["n_partial"] = _sim(ln, rn, fuzz.partial_ratio, workers)
+        f["n_jw"] = cpdist(ln, rn, scorer=JaroWinkler.normalized_similarity, workers=workers, dtype=np.float32)
+        f["n_skel_ratio"] = _sim(L["name_skel"].tolist(), R["name_skel"].tolist(), fuzz.ratio, workers)
+        f["n_skel_tset"] = _sim(L["name_skel"].tolist(), R["name_skel"].tolist(), fuzz.token_set_ratio, workers)
+        lc, rc = L["name_compact"].tolist(), R["name_compact"].tolist()
+        f["n_compact_ratio"] = _sim(lc, rc, fuzz.ratio, workers)
+        f["n_compact_partial"] = _sim(lc, rc, fuzz.partial_ratio, workers)
+        f["n_clean_tset"] = _sim(L["name_clean"].tolist(), R["name_clean"].tolist(), fuzz.token_set_ratio, workers)
+        f["n_core_eq"] = (L["name_core"].to_numpy() == R["name_core"].to_numpy()).astype(np.float32)
+        f["n_ntok_l"] = L["name_core"].str.count(" ").to_numpy(np.float32) + 1
+        f["n_ntok_r"] = R["name_core"].str.count(" ").to_numpy(np.float32) + 1
+        f["r_is_web"] = R["name_is_web"].to_numpy(np.float32)
+        f["r_has_alias"] = R["name_has_alias"].to_numpy(np.float32)
+        f["r_native"] = R["name_native"].to_numpy(np.float32)
+        la, ra = L["addr_clean"].tolist(), R["addr_clean"].tolist()
+        f["a_ratio"] = _sim(la, ra, fuzz.ratio, workers)
+        f["a_tset"] = _sim(la, ra, fuzz.token_set_ratio, workers)
+        f["a_tsort"] = _sim(la, ra, fuzz.token_sort_ratio, workers)
+        f["a_alpha_tset"] = _sim(L["addr_alpha"].tolist(), R["addr_alpha"].tolist(), fuzz.token_set_ratio, workers)
+        f["a_skel_tset"] = _sim(L["addr_skel"].tolist(), R["addr_skel"].tolist(), fuzz.token_set_ratio, workers)
+        f["a_num_jac"], f["a_first_num_eq"] = _num_features(L["addr_nums"].tolist(), R["addr_nums"].tolist())
+        f["r_addr_empty"] = R["addr_empty"].to_numpy(np.float32)
+        f["r_addr_ncomp"] = R["addr_ncomp"].to_numpy(np.float32)
+        f["l_addr_ncomp"] = L["addr_ncomp"].to_numpy(np.float32)
+        f["r_src"] = R["src"].to_numpy(np.float32)
+        parts.append(pd.DataFrame(f))
+    return pd.concat(parts, ignore_index=True).set_axis(cand.index)
+
+
+def context_features(cand: pd.DataFrame) -> pd.DataFrame:
+    """Blocking scores plus rank/gap features. Must see ALL candidate pairs of the split, because the
+    per-S2/S3 ranks measure competition between Source-1 records."""
+    C = pd.DataFrame({"name_cos": cand["name_cos"].to_numpy(np.float32),
+                      "addr_cos": cand["addr_cos"].to_numpy(np.float32)}, index=cand.index)
+    add_context(C, cand)
+    return C
+
+
+def pair_features(cand: pd.DataFrame, s1: pd.DataFrame, s23: pd.DataFrame, rows=None, workers=-1) -> pd.DataFrame:
+    """Full feature matrix for `cand` rows selected by the boolean mask `rows` (default all)."""
+    C = context_features(cand)
+    sub = cand if rows is None else cand[rows]
+    return pd.concat([string_features(sub, s1, s23, workers), C.loc[sub.index]], axis=1)
+
+
+def add_context(F: pd.DataFrame, cand: pd.DataFrame, score_col="comb"):
+    """Rank/gap features of a score within each S1's candidate list and each S2/S3 record's S1 list."""
+    if score_col == "comb":
+        F["comb"] = F["name_cos"] + F["addr_cos"]
+    sc = F[score_col].to_numpy(np.float32)
+    g1, g2 = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
+    F[f"{score_col}_rank_s1"] = _group_rank(sc, g1)
+    F[f"{score_col}_gap_s1"] = sc - pd.Series(sc).groupby(g1).transform("max").to_numpy(np.float32)
+    F[f"{score_col}_rank_r"] = _group_rank(sc, g2)
+    F[f"{score_col}_gap_r"] = sc - pd.Series(sc).groupby(g2).transform("max").to_numpy(np.float32)
+    if score_col == "comb":
+        F["n_cand_s1"] = pd.Series(g1).map(pd.Series(g1).value_counts()).to_numpy(np.float32)
+        F["n_cand_r"] = pd.Series(g2).map(pd.Series(g2).value_counts()).to_numpy(np.float32)
