@@ -111,20 +111,21 @@ def _rank_gap(score, group):
     return rank, gap
 
 
-def context_features(cand: pd.DataFrame, rows=None) -> pd.DataFrame:
-    """Blocking scores plus rank/gap features. Ranks are computed over ALL candidate pairs of the split
-    (the per-S2/S3 ranks measure competition between Source-1 records); only the rows selected by the
-    boolean mask `rows` are returned, so the full-length feature matrix never exists."""
+def context_arrays(cols, rows=None) -> dict:
+    """Context features as a dict of float32 arrays. `cols` maps column name -> full-length array of the
+    candidate table (s1_idx, r_idx, name_cos, addr_cos, optional multi-channel columns). Ranks are computed
+    over ALL pairs; only `rows` (boolean mask) are returned. With rows=None the pass-through columns are
+    views, so no full-length copy of the candidate table is made."""
     sel = slice(None) if rows is None else np.flatnonzero(rows)
-    g1, g2 = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
-    name, addr = cand["name_cos"].to_numpy(np.float32), cand["addr_cos"].to_numpy(np.float32)
+    g1, g2 = cols["s1_idx"], cols["r_idx"]
+    name, addr = np.asarray(cols["name_cos"], np.float32), np.asarray(cols["addr_cos"], np.float32)
     C = {"name_cos": name[sel], "addr_cos": addr[sel]}
     scores = {"comb": name + addr}
-    extra = [c for c in cand.columns if c not in ("s1_idx", "r_idx", "name_cos", "addr_cos")]
+    extra = [c for c in cols if c not in ("s1_idx", "r_idx", "name_cos", "addr_cos")]
     for c in extra:  # multi-channel blocker: fused score, channel count, per-channel ranks
-        C[c] = cand[c].to_numpy(np.float32)[sel]
+        C[c] = np.asarray(cols[c], np.float32)[sel]
     if "rrf" in extra:
-        scores["rrf"] = cand["rrf"].to_numpy(np.float32)
+        scores["rrf"] = np.asarray(cols["rrf"], np.float32)
     for name_, sc in scores.items():
         if name_ == "comb":
             C["comb"] = sc[sel]
@@ -134,7 +135,13 @@ def context_features(cand: pd.DataFrame, rows=None) -> pd.DataFrame:
             del rank, gap
     for side, g in (("s1", g1), ("r", g2)):
         C[f"n_cand_{side}"] = np.bincount(g)[g][sel].astype(np.float32)
-    index = cand.index if rows is None else cand.index[sel]
+    return C
+
+
+def context_features(cand: pd.DataFrame, rows=None) -> pd.DataFrame:
+    """DataFrame form of `context_arrays` (use only when the selected rows fit comfortably in memory)."""
+    C = context_arrays({c: cand[c].to_numpy() for c in cand.columns}, rows)
+    index = cand.index if rows is None else cand.index[np.flatnonzero(rows)]
     return pd.DataFrame(C, index=index)
 
 

@@ -26,8 +26,9 @@ from .blocking import generate_candidates
 from .buckets import assign_modes, name_frequency, pair_table
 from .channels import pair_conj_cos, retrieve
 from .config import SEED
-from .features import context_columns, context_features, extra_features, pair_features, string_features
-from .io import read_ground_truth, write_id_lists
+from .features import (context_arrays, context_columns, context_features, extra_features, pair_features,
+                       string_features)
+from .io import read_ground_truth, write_grouped
 from .labels import blocking_report, label_pairs
 from .metric import breakdown
 from .postprocess import (apply_calibrator, count_match_delta, fit_calibrator, rule_mask, select, select_rule,
@@ -328,27 +329,45 @@ def _s1_chunks(s1_idx, rows_per_chunk=4_000_000):
     return [order[a:b] for a, b in zip(cuts[:-1], cuts[1:])]
 
 
+def _read_columns(path):
+    """Parquet columns as numpy arrays, one column at a time (no pandas block consolidation copy)."""
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(path)
+    return {c: pf.read(columns=[c]).column(0).to_numpy() for c in pf.schema_arrow.names}
+
+
 def cmd_predict(args):
+    """Test prediction, memory-lean: the 1e8-row candidate table is kept as separate numpy columns and
+    feature matrices are only built 4M rows at a time."""
     out = Path(args.work) / "experiments" / args.exp
     models = _load_models(out, "model") or [lgb.Booster(model_file=str(out / "model.txt"))]
     names = models[0].feature_name()
     log(f"stage 1: {len(models)} model(s), {len(names)} features")
-    s1, s23, cand = stage_candidates(args, "test")
-    C = context_features(cand)
-    ctx_cols = list(C.columns)
-    cand = cand[["s1_idx", "r_idx"]]  # the extra blocking columns now live in C
+    pc = Path(args.work) / "test" / f"cand_{args.block_tag}.parquet"
+    if not pc.exists():  # blocking in this process; prefer `ber.run block --split test` beforehand
+        stage_candidates(args, "test")
+        gc.collect()
+    s1, s23 = load_prepared(args.data, "test", args.work)
+    cols = _read_columns(pc)
+    cand = pd.DataFrame({"s1_idx": cols["s1_idx"], "r_idx": cols["r_idx"]})
+    log(f"test: {len(cand)} candidate pairs ({len(cand) / len(s1):.1f}/S1)")
+    C = context_arrays(cols)
+    del cols
     gc.collect()
+    ctx_cols = list(C)
     if "conj_cos" in names:
         C["conj_cos"] = pair_conj_cos(cand, s1, s23, log=log)
     p1 = np.empty(len(cand), np.float32)
-    step = 4_000_000  # stream string features so the full test matrix never sits in memory
+    step = 4_000_000  # features are built per chunk; the full test matrix never exists
     for a in range(0, len(cand), step):
         sub = cand.iloc[a:a + step]
         parts = [string_features(sub, s1, s23)]
         if "a_num_tset" in names:
             parts.append(extra_features(sub, s1, s23))
-        Fc = pd.concat(parts + [C.iloc[a:a + step]], axis=1)[names]
+        parts.append(pd.DataFrame({k: v[a:a + step] for k, v in C.items()}, index=sub.index))
+        Fc = pd.concat(parts, axis=1)[names]
         p1[a:a + step] = np.mean([m.predict(Fc) for m in models], axis=0)
+        del Fc, parts
         log(f"stage 1: predicted {min(a + step, len(cand))}/{len(cand)}")
     p = p1
     sm = json.loads((out / "stack_metrics.json").read_text()) if (out / "stack_metrics.json").exists() else None
@@ -357,9 +376,12 @@ def cmd_predict(args):
         names2 = stack[0].feature_name()
         p = np.empty(len(cand), np.float32)
         for rows in _s1_chunks(cand["s1_idx"].to_numpy()):
-            X2 = stack_features(cand.iloc[rows], p1[rows], s23, C.iloc[rows][ctx_cols])[names2]
+            Cc = pd.DataFrame({k: C[k][rows] for k in ctx_cols})
+            X2 = stack_features(cand.iloc[rows], p1[rows], s23, Cc)[names2]
             p[rows] = np.mean([m.predict(X2) for m in stack], axis=0)
             log(f"stage 2: {len(rows)} pairs")
+    del C
+    gc.collect()
     pd.DataFrame({"s1_idx": cand["s1_idx"], "r_idx": cand["r_idx"], "p1": p1, "p": p}).to_parquet(
         out / "test_pairs_proba.parquet")
     write_selection(args, out, cand, p, s1, s23)
@@ -392,14 +414,12 @@ def write_selection(args, out, cand, p, s1, s23):
             info["delta"][c] = d
             log(f"count match {c}: delta {d:+.3f} -> {target:.3f} selected per S1")
     s1_ids, r_ids = s1["entity_id"].to_numpy(), s23["entity_id"].to_numpy()
-    pred = select_rule(cand, p, s1_ids, r_ids, rule)
-    cands = {}
-    for a, b in zip(s1_ids[cand["s1_idx"].to_numpy()], r_ids[cand["r_idx"].to_numpy()]):
-        cands.setdefault(a, []).append(b)
+    keep = rule_mask(cand, p, rule)
+    si, ri = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
     od = Path(args.out)
-    write_id_lists(od / "matching_results.tsv", s1_ids, pred, "matched_entity_ids")
-    write_id_lists(od / "candidate_pairs.tsv", s1_ids, cands, "candidate_entity_ids")
-    n = pd.Series({e: len(pred.get(e, ())) for e in s1_ids})
+    write_grouped(od / "matching_results.tsv", s1_ids, si[keep], ri[keep], r_ids, "matched_entity_ids")
+    write_grouped(od / "candidate_pairs.tsv", s1_ids, si, ri, r_ids, "candidate_entity_ids")
+    n = np.bincount(si[keep], minlength=len(s1_ids))  # matches per S1 (exclusivity makes pairs unique)
     info["per_country"] = {c: {"mean_matches": float(n[s1c == c].mean()), "empty_rate": float((n[s1c == c] == 0).mean()),
                                "n_s1": int((s1c == c).sum())} for c in sorted(set(s1c))}
     (od / "selection_info.json").write_text(json.dumps(info, indent=1))

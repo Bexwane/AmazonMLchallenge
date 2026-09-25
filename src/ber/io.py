@@ -47,3 +47,21 @@ def write_id_lists(path, s1_ids, lists, header2: str):
             ids = lists.get(s1, ())
             # dict.fromkeys keeps order and removes duplicates
             f.write(f"{s1}\t{','.join(dict.fromkeys(ids))}\n")
+
+
+def write_grouped(path, s1_ids, s1_idx, r_idx, r_ids, header2: str):
+    """Like write_id_lists, from parallel index arrays (s1_idx[i], r_idx[i]); one row per S1 id in s1_ids
+    order, ids de-duplicated in first-seen order. Memory stays O(pairs) in numpy, not Python objects."""
+    import numpy as np
+    order = np.argsort(s1_idx, kind="stable")
+    g, r = s1_idx[order], r_idx[order]
+    starts = np.flatnonzero(np.r_[True, g[1:] != g[:-1]]) if len(g) else np.empty(0, np.int64)
+    ends = np.r_[starts[1:], len(g)]
+    span = {int(g[a]): (int(a), int(b)) for a, b in zip(starts, ends)}
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(f"source1_entity_id\t{header2}\n")
+        for i, s1 in enumerate(s1_ids):
+            ab = span.get(i)
+            ids = "" if ab is None else ",".join(dict.fromkeys(r_ids[r[ab[0]:ab[1]]].tolist()))
+            f.write(f"{s1}\t{ids}\n")
