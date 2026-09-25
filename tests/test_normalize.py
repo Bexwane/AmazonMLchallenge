@@ -36,3 +36,14 @@ def test_address_canonical():
     f1 = normalize_address("63 R. DE DIEPPE, LILLE, Hauts-de-France")
     assert f1["addr_clean"].startswith("63 rue dieppe lille")
     assert normalize_address("")["addr_empty"]
+
+
+def test_france_rules():
+    from ber.normalize import normalize_address, normalize_name
+    a = normalize_address("N° 551 AVENUE DE L’AERODROME, LA TESTE DE BUCH, Gironde")
+    b = normalize_address("551 Avenue de l'Aerodrome, La Teste-de-Buch, Nouvelle-Aquitaine")
+    assert a["addr_clean"] == b["addr_clean"] and a["addr_nums"] == "551"
+    assert normalize_address("N°37 RUE X, TOURCOING, Nord")["addr_clean"] ==         normalize_address("37 Rue X, Tourcoing, Hauts-de-France")["addr_clean"]
+    assert normalize_name("Ets Fleurs SARL")["name_core"] == normalize_name("Établissements Fleurs S.A.R.L.")["name_core"] == "fleurs"
+    assert normalize_name("Antenne & Cie SARL")["name_core"] == normalize_name("Antenne Compagnie")["name_core"]
+    assert normalize_address("12 N Main St, Austin, TX")["addr_clean"] == "12 n main st austin tx"  # US 'N' untouched
