@@ -97,8 +97,10 @@ def rowwise_dot(A, B, ia, ib, chunk=2_000_000):
 
 
 def generate_candidates(s1: pd.DataFrame, s23: pd.DataFrame, k_comb=40, k_name=10, df_cap=2000,
-                        chunk=4000, workers=4, log=print) -> pd.DataFrame:
-    """Return a frame of (s1_idx, r_idx, name_cos, addr_cos) with positional indices into s1 / s23."""
+                        chunk=4000, workers=4, log=print, on_country=None) -> pd.DataFrame:
+    """Return a frame of (s1_idx, r_idx, name_cos, addr_cos) with positional indices into s1 / s23.
+    `on_country(country, ia, ib, mats)` is called with the per-country weighted and raw key matrices
+    before they are freed (used by the blocking evaluator to diagnose misses without re-hashing)."""
     An_all, Aa_all = key_matrices(s1)
     Bn_all, Ba_all = key_matrices(s23)
     out = []
@@ -107,8 +109,9 @@ def generate_candidates(s1: pd.DataFrame, s23: pd.DataFrame, k_comb=40, k_name=1
         ib = np.flatnonzero((s23["country"] == country).to_numpy())
         if len(ia) == 0 or len(ib) == 0:
             continue
-        An, Bn = _weight(An_all[ia], Bn_all[ib], df_cap)
-        Aa, Ba = _weight(Aa_all[ia], Ba_all[ib], df_cap)
+        An0, Aa0, Bn0, Ba0 = An_all[ia], Aa_all[ia], Bn_all[ib], Ba_all[ib]
+        An, Bn = _weight(An0, Bn0, df_cap)
+        Aa, Ba = _weight(Aa0, Ba0, df_cap)
         Ac = sp.hstack([An, Aa]).tocsr()
         Bct = sp.hstack([Bn, Ba]).T.tocsr()
         Bnt = Bn.T.tocsr()
@@ -127,4 +130,8 @@ def generate_candidates(s1: pd.DataFrame, s23: pd.DataFrame, k_comb=40, k_name=1
         addr_cos = rowwise_dot(Aa, Ba, la, lb)
         out.append(pd.DataFrame({"s1_idx": ia[la], "r_idx": ib[lb], "name_cos": name_cos, "addr_cos": addr_cos}))
         log(f"  blocking {country}: {len(ia)} S1 x {len(ib)} S2/S3 -> {len(la)} pairs ({len(la) / len(ia):.1f}/S1)")
+        if on_country is not None:
+            on_country(country, ia, ib, {"An": An, "Aa": Aa, "Bn": Bn, "Ba": Ba, "Bct": Bct,
+                                         "An0": An0, "Aa0": Aa0, "Bn0": Bn0, "Ba0": Ba0})
+        del An0, Aa0, Bn0, Ba0, An, Aa, Bn, Ba, Ac, Bct, Bnt
     return pd.concat(out, ignore_index=True)

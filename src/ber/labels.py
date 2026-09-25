@@ -16,7 +16,8 @@ def label_pairs(cand: pd.DataFrame, s1: pd.DataFrame, s23: pd.DataFrame, truth: 
     return (r_owner == s1_ids).astype(np.int8)
 
 
-def blocking_report(cand: pd.DataFrame, y: np.ndarray, s1: pd.DataFrame, s23: pd.DataFrame, truth: dict) -> dict:
+def blocking_report(cand: pd.DataFrame, y: np.ndarray, s1: pd.DataFrame, s23: pd.DataFrame, truth: dict,
+                    rank_out=None) -> dict:
     n_true = sum(len(v) for v in truth.values())
     rep = {"pairs": len(cand), "pairs_per_s1": len(cand) / len(truth), "pair_recall": float(y.sum() / n_true)}
     # recall by country and by source
@@ -33,7 +34,9 @@ def blocking_report(cand: pd.DataFrame, y: np.ndarray, s1: pd.DataFrame, s23: pd
         rep[f"recall_S{s}"] = int((src == s).sum()) / tot if tot else float("nan")
     # recall if we kept only the top-k by name_cos + addr_cos
     score = cand["name_cos"].to_numpy() + cand["addr_cos"].to_numpy()
-    rank = pd.Series(-score).groupby(cand["s1_idx"].to_numpy()).rank(method="first").to_numpy()
+    rank = pd.Series(-score).groupby(cand["s1_idx"].to_numpy()).rank(method="first").to_numpy(np.float32)
+    if rank_out is not None:
+        rank_out.append(rank)
     for k in (1, 3, 5, 10, 20, 30):
         rep[f"recall@{k}"] = float(y[rank <= k].sum() / n_true)
     # oracle: perfect classifier over the candidate set

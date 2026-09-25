@@ -236,14 +236,21 @@ def rescue(q, pool, max_block=30):
 
 
 # ---------------------------------------------------------------------------
-# Dense retrieval (optional, GPU). Default multilingual-e5-small (MIT, 118M params). Pool
-# embeddings are fp16 and computed once per country; top-k is an exact chunked GPU matmul.
+# Targeted multilingual dense retrieval (GPU). Only pool records whose name is in an Indic script are
+# encoded (the measured native-script miss bucket), so no 10M-row embedding matrix is ever built.
+# Queries (Latin Source-1 records) search that subset with an exact chunked fp16 GPU matmul.
+#   bge_native: BAAI/bge-m3 (MIT, 568M params, 1024-d)
+#   e5_native:  intfloat/multilingual-e5-small (MIT, 118M params, 384-d), ablation
 # ---------------------------------------------------------------------------
-def _texts(df):
-    return ("query: " + df["business_name"].astype(str) + ", " + df["business_address"].astype(str)).tolist()
+DENSE_MODELS = {"bge_native": ("BAAI/bge-m3", ""), "e5_native": ("intfloat/multilingual-e5-small", "query: ")}
+DENSE_INFO = {}  # filled per run: model, revision, dim, dtype, encoded counts, seconds
 
 
-def _encode(model, texts, bs=512, chunk=200_000):
+def _texts(df, prefix):
+    return (prefix + df["business_name"].astype(str) + ", " + df["business_address"].astype(str)).tolist()
+
+
+def _encode(model, texts, bs=256, chunk=100_000):
     import torch
     out = torch.empty((len(texts), model.get_sentence_embedding_dimension()), dtype=torch.float16, device="cuda")
     for s in range(0, len(texts), chunk):
@@ -253,62 +260,125 @@ def _encode(model, texts, bs=512, chunk=200_000):
     return out
 
 
-def dense(q, pool, k=50):
+def _empty():
+    return np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0, np.float32)
+
+
+def _dense_native(q, pool, which, k):
+    import time
     try:
         import torch
         from sentence_transformers import SentenceTransformer
     except ImportError:
-        print("dense: sentence-transformers/torch missing, skipped")
-        return np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0, np.float32)
+        print(f"{which}: sentence-transformers/torch missing, skipped")
+        return _empty()
     if not torch.cuda.is_available():
-        print("dense: no GPU, skipped")
-        return np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0, np.float32)
-    name = os.environ.get("BER_DENSE_MODEL", "intfloat/multilingual-e5-small")
-    model = _memo(("dense_model", name), lambda: SentenceTransformer(name, device="cuda").half())
-    model.max_seq_length = 64
-    P = _memo(("dense_pool", name), lambda: _encode(model, _texts(pool)))
-    Q = _encode(model, _texts(q))
+        print(f"{which}: no GPU, skipped")
+        return _empty()
+    idx = np.flatnonzero(pool["name_native"].to_numpy(bool))
+    if len(idx) == 0:
+        return _empty()
+    name, prefix = DENSE_MODELS[which]
+    info = DENSE_INFO.setdefault(which, {"model": name, "dtype": "float16", "index": "exact GPU matmul (chunked)",
+                                         "target": "pool records with Indic-script names"})
+
+    def load():
+        m = SentenceTransformer(name, device="cuda").half()
+        m.max_seq_length = 64
+        try:
+            from huggingface_hub import model_info
+            info["revision"] = model_info(name).sha
+        except Exception:
+            info["revision"] = "unknown"
+        info["dim"] = m.get_sentence_embedding_dimension()
+        return m
+    model = _memo(("dense_model", which), load)
+
+    def enc_pool():
+        t = time.time()
+        e = _encode(model, _texts(pool.iloc[idx], prefix))
+        info["pool_encoded"] = info.get("pool_encoded", 0) + len(idx)
+        info["pool_encode_sec"] = info.get("pool_encode_sec", 0) + round(time.time() - t, 1)
+        return e
+    P = _memo(("dense_pool", which), enc_pool)
+    t = time.time()
+    Q = _encode(model, _texts(q, prefix))
+    info["queries_encoded"] = info.get("queries_encoded", 0) + len(q)
+    k = min(k, len(idx))
     rows, cols, vals = [], [], []
-    for s in range(0, len(Q), 128):
-        v, c = torch.topk(Q[s:s + 128] @ P.T, k, dim=1)
+    for s in range(0, len(Q), 256):
+        v, c = torch.topk(Q[s:s + 256] @ P.T, k, dim=1)
         rows.append(np.repeat(np.arange(s, s + len(c)), k)); cols.append(c.cpu().numpy().ravel())
         vals.append(v.float().cpu().numpy().ravel())
-    return np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
+    info["query_sec"] = info.get("query_sec", 0) + round(time.time() - t, 1)
+    info["gpu_peak_gib"] = round(torch.cuda.max_memory_allocated() / 2 ** 30, 2)
+    return np.concatenate(rows), idx[np.concatenate(cols)], np.concatenate(vals)
+
+
+def bge_native(q, pool, k=20):
+    return _dense_native(q, pool, "bge_native", k)
+
+
+def e5_native(q, pool, k=20):
+    return _dense_native(q, pool, "e5_native", k)
 
 
 CHANNELS = {"base": base, "base_wide": base_wide, "addr_only": addr_only, "name_noaddr": name_noaddr, "conj": conj,
-            "bm25": bm25, "rescue": rescue, "dense": dense}
+            "bm25": bm25, "rescue": rescue, "bge_native": bge_native, "e5_native": e5_native}
 
 
 # ---------------------------------------------------------------------------
-# Production blocker: union of channels, fused by reciprocal rank, truncated to `m` per Source-1.
-# Rescue pairs (exact keys, small blocks) are exempt from truncation.
+# Production blocker: UNION of channels, deduplicated. Recall is defined on the union. Reciprocal-rank
+# fusion only adds ranking features (rrf, per-channel ranks); an optional cap `m` per Source-1 is a
+# separate, separately measured choice (0 = keep everything). Rescue pairs are never capped.
+# A channel spec is "name" or "name:depth", e.g. "base,conj:20,bm25:20,name_noaddr:5,rescue".
 # ---------------------------------------------------------------------------
 RRF_K = 60
 NO_RANK = 999.0
+_DEPTH_ARG = {"base_wide": "k", "addr_only": "k", "name_noaddr": "k", "conj": "k", "bm25": "k",
+              "rescue": "max_block", "bge_native": "k", "e5_native": "k"}
 
 
-def _fuse(q, pool, names, m, df_cap):
+def parse_spec(spec):
+    """'base,conj:20' -> [('base', {}), ('conj', {'k': 20})]"""
+    out = []
+    for item in [x for x in spec.split(",") if x]:
+        name, _, depth = item.partition(":")
+        if name not in CHANNELS:
+            raise ValueError(f"unknown channel {name!r}; known: {sorted(CHANNELS)}")
+        out.append((item, name, {_DEPTH_ARG[name]: int(depth)} if depth else {}))
+    return out
+
+
+def run_channel(item, q, pool):
+    _, name, kw = next(iter(parse_spec(item)))
+    return CHANNELS[name](q, pool, **kw)
+
+
+def _fuse(q, pool, specs, m, df_cap):
     parts = []
-    for n in names:
-        qa, rb, v = CHANNELS[n](q, pool)
+    for item, name, kw in specs:
+        qa, rb, v = CHANNELS[name](q, pool, **kw)
         d = pd.DataFrame({"q": qa, "r": rb, "v": v}).sort_values(["q", "v"], ascending=[True, False], kind="stable")
         d = d.drop_duplicates(["q", "r"])
         d["rank"] = (d.groupby("q").cumcount() + 1).astype(np.float32)
-        d["ch"] = n
+        d["ch"] = name
         parts.append(d[["q", "r", "rank", "ch"]])
     u = pd.concat(parts, ignore_index=True)
+    names = [name for _, name, _ in specs]
     u["s"] = 1.0 / (RRF_K + u["rank"])
     wide = u.pivot_table(index=["q", "r"], columns="ch", values="rank", aggfunc="min")
     wide = wide.reindex(columns=names).fillna(NO_RANK).astype(np.float32)
     wide.columns = [f"rank_{n}" for n in names]
     agg = u.groupby(["q", "r"]).agg(rrf=("s", "sum"), n_ch=("s", "size"))
-    f = agg.join(wide).reset_index().sort_values(["q", "rrf"], ascending=[True, False], kind="stable")
-    pos = f.groupby("q").cumcount() + 1
-    keep = pos <= m
-    if "rescue" in names:
-        keep |= f["rank_rescue"] < NO_RANK
-    f = f[keep.to_numpy()].reset_index(drop=True)
+    f = agg.join(wide).reset_index()
+    if m:
+        f = f.sort_values(["q", "rrf"], ascending=[True, False], kind="stable")
+        keep = (f.groupby("q").cumcount() + 1) <= m
+        if "rescue" in names:
+            keep |= f["rank_rescue"] < NO_RANK
+        f = f[keep.to_numpy()]
+    f = f.reset_index(drop=True)
     P = _pool_base(pool, df_cap)
     An, Aa = _query_base(q, P)
     qi, ri = f["q"].to_numpy(), f["r"].to_numpy()
@@ -319,8 +389,9 @@ def _fuse(q, pool, names, m, df_cap):
     return f
 
 
-def retrieve(s1, s23, names, m=80, df_cap=2500, qchunk=50_000, log=print):
+def retrieve(s1, s23, spec, m=0, df_cap=2500, qchunk=50_000, log=print):
     """Candidate pairs (s1_idx, r_idx, name_cos, addr_cos, rrf, n_ch, rank_<channel>...) within each country."""
+    specs = parse_spec(spec) if isinstance(spec, str) else parse_spec(",".join(spec))
     out = []
     for country in sorted(set(s1["country"]) | set(s23["country"])):
         ia = np.flatnonzero((s1["country"] == country).to_numpy())
@@ -332,9 +403,9 @@ def retrieve(s1, s23, names, m=80, df_cap=2500, qchunk=50_000, log=print):
         n0 = sum(len(o) for o in out)
         for s in range(0, len(ia), qchunk):
             q = s1.iloc[ia[s:s + qchunk]].reset_index(drop=True)
-            f = _fuse(q, pool, names, m, df_cap)
-            f.insert(0, "s1_idx", ia[s + f.pop("q").to_numpy()])
-            f.insert(1, "r_idx", ib[f.pop("r").to_numpy()])
+            f = _fuse(q, pool, specs, m, df_cap)
+            f.insert(0, "s1_idx", ia[s + f.pop("q").to_numpy()].astype(np.int32))
+            f.insert(1, "r_idx", ib[f.pop("r").to_numpy()].astype(np.int32))
             out.append(f)
             log(f"  retrieve {country}: {min(s + qchunk, len(ia))}/{len(ia)} S1")
         n = sum(len(o) for o in out) - n0

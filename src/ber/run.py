@@ -47,7 +47,7 @@ def stage_candidates(args, split):
         cand = pd.read_parquet(pc)
     else:
         if args.channels:
-            cand = retrieve(s1, s23, args.channels.split(","), m=args.rrf_m, df_cap=args.df_cap, log=log)
+            cand = retrieve(s1, s23, args.channels, m=args.rrf_m, df_cap=args.df_cap, log=log)
         else:
             cand = generate_candidates(s1, s23, k_comb=args.k_comb, k_name=args.k_name, df_cap=args.df_cap,
                                        chunk=args.block_chunk, log=log)
@@ -169,6 +169,13 @@ def cmd_predict(args):
     log(f"wrote {od}: {n} matches for {len(pred)}/{len(s1)} S1 ({len(s1) - len(pred)} predicted singletons)")
 
 
+def block_tag(args):
+    """Cache tag of a blocker configuration (shared with scripts/eval_blocking_full.py)."""
+    if args.channels:
+        return f"ch-{args.channels.replace(',', '+').replace(':', '')}_m{args.rrf_m}_df{args.df_cap}"
+    return f"k{args.k_comb}_n{args.k_name}_df{args.df_cap}"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["cv", "fit", "predict"])
@@ -184,14 +191,12 @@ def main():
     ap.add_argument("--block-chunk", type=int, default=2000)
     ap.add_argument("--channels", default="", help="multi-channel blocker, e.g. base_wide,conj,bm25,name_noaddr,rescue "
                                                     "(empty = legacy E003 blocker)")
-    ap.add_argument("--rrf-m", type=int, default=80, help="candidates kept per S1 after RRF (rescue pairs always kept)")
+    ap.add_argument("--rrf-m", type=int, default=0, help="optional cap per S1 after RRF (0 = keep the whole union; "
+                                                         "rescue pairs are always kept)")
     ap.add_argument("--lr", type=float, default=0.1, help="LightGBM learning rate (0.05 in E001-E003)")
     args = ap.parse_args()
     PARAMS["learning_rate"] = args.lr
-    if args.channels:
-        args.block_tag = f"ch-{args.channels.replace(',', '+')}_m{args.rrf_m}_df{args.df_cap}"
-    else:
-        args.block_tag = f"k{args.k_comb}_n{args.k_name}_df{args.df_cap}"
+    args.block_tag = block_tag(args)
     {"cv": cmd_cv, "fit": cmd_fit, "predict": cmd_predict}[args.cmd](args)
 
 

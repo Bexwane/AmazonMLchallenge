@@ -44,3 +44,15 @@ python scripts/make_subset.py 0.01                      # -> data/subsets/f0.01/
 python -m pytest -q tests
 PYTHONPATH=src python -m ber.run cv --data data/subsets/f0.01 --work data/subsets/work_f0.01 --exp dev --cv-frac 0.5
 ```
+
+## Blocking experiments (E004-E007, blocking only)
+```
+python scripts/recall_probe.py --data DATA --work WORK --countries India --out PROBE   # repeat per country
+python scripts/recall_probe.py --combine --out PROBE                                    # E003-E007 unions
+python scripts/eval_blocking_full.py --data DATA --work WORK --exp E003-fullblock --reports reports
+python scripts/eval_blocking_full.py --data DATA --work WORK --exp E007-fullblock --channels "$(cat PROBE/e007_spec.txt)"
+python scripts/make_reports.py --baseline WORK/experiments/E003-fullblock/blocking_full.json \
+    --probe PROBE/experiments.json --final WORK/experiments/E007-fullblock/blocking_full.json --out reports
+```
+`notebooks/kaggle_E004_recall_probe.ipynb` runs all of it on Kaggle. A chosen union is used downstream with
+`python -m ber.run cv|fit|predict ... --channels "<spec>"` (the candidate cache is shared).
