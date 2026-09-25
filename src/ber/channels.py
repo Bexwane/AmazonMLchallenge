@@ -278,3 +278,67 @@ def dense(q, pool, k=50):
 
 CHANNELS = {"base": base, "base_wide": base_wide, "addr_only": addr_only, "name_noaddr": name_noaddr, "conj": conj,
             "bm25": bm25, "rescue": rescue, "dense": dense}
+
+
+# ---------------------------------------------------------------------------
+# Production blocker: union of channels, fused by reciprocal rank, truncated to `m` per Source-1.
+# Rescue pairs (exact keys, small blocks) are exempt from truncation.
+# ---------------------------------------------------------------------------
+RRF_K = 60
+NO_RANK = 999.0
+
+
+def _fuse(q, pool, names, m, df_cap):
+    parts = []
+    for n in names:
+        qa, rb, v = CHANNELS[n](q, pool)
+        d = pd.DataFrame({"q": qa, "r": rb, "v": v}).sort_values(["q", "v"], ascending=[True, False], kind="stable")
+        d = d.drop_duplicates(["q", "r"])
+        d["rank"] = (d.groupby("q").cumcount() + 1).astype(np.float32)
+        d["ch"] = n
+        parts.append(d[["q", "r", "rank", "ch"]])
+    u = pd.concat(parts, ignore_index=True)
+    u["s"] = 1.0 / (RRF_K + u["rank"])
+    wide = u.pivot_table(index=["q", "r"], columns="ch", values="rank", aggfunc="min")
+    wide = wide.reindex(columns=names).fillna(NO_RANK).astype(np.float32)
+    wide.columns = [f"rank_{n}" for n in names]
+    agg = u.groupby(["q", "r"]).agg(rrf=("s", "sum"), n_ch=("s", "size"))
+    f = agg.join(wide).reset_index().sort_values(["q", "rrf"], ascending=[True, False], kind="stable")
+    pos = f.groupby("q").cumcount() + 1
+    keep = pos <= m
+    if "rescue" in names:
+        keep |= f["rank_rescue"] < NO_RANK
+    f = f[keep.to_numpy()].reset_index(drop=True)
+    P = _pool_base(pool, df_cap)
+    An, Aa = _query_base(q, P)
+    qi, ri = f["q"].to_numpy(), f["r"].to_numpy()
+    f["name_cos"] = np.asarray(An[qi].multiply(P["Bn"][ri]).sum(1)).ravel().astype(np.float32)
+    f["addr_cos"] = np.asarray(Aa[qi].multiply(P["Ba"][ri]).sum(1)).ravel().astype(np.float32)
+    f["rrf"] = f["rrf"].astype(np.float32)
+    f["n_ch"] = f["n_ch"].astype(np.float32)
+    return f
+
+
+def retrieve(s1, s23, names, m=80, df_cap=2500, qchunk=50_000, log=print):
+    """Candidate pairs (s1_idx, r_idx, name_cos, addr_cos, rrf, n_ch, rank_<channel>...) within each country."""
+    out = []
+    for country in sorted(set(s1["country"]) | set(s23["country"])):
+        ia = np.flatnonzero((s1["country"] == country).to_numpy())
+        ib = np.flatnonzero((s23["country"] == country).to_numpy())
+        if len(ia) == 0 or len(ib) == 0:
+            continue
+        clear()
+        pool = s23.iloc[ib].reset_index(drop=True)
+        n0 = sum(len(o) for o in out)
+        for s in range(0, len(ia), qchunk):
+            q = s1.iloc[ia[s:s + qchunk]].reset_index(drop=True)
+            f = _fuse(q, pool, names, m, df_cap)
+            f.insert(0, "s1_idx", ia[s + f.pop("q").to_numpy()])
+            f.insert(1, "r_idx", ib[f.pop("r").to_numpy()])
+            out.append(f)
+            log(f"  retrieve {country}: {min(s + qchunk, len(ia))}/{len(ia)} S1")
+        n = sum(len(o) for o in out) - n0
+        log(f"  retrieve {country}: {len(ia)} S1 x {len(ib)} S2/S3 -> {n} pairs ({n / len(ia):.1f}/S1)")
+        del pool
+    clear()
+    return pd.concat(out, ignore_index=True)

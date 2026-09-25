@@ -80,6 +80,11 @@ def context_features(cand: pd.DataFrame) -> pd.DataFrame:
     C = pd.DataFrame({"name_cos": cand["name_cos"].to_numpy(np.float32),
                       "addr_cos": cand["addr_cos"].to_numpy(np.float32)}, index=cand.index)
     add_context(C, cand)
+    extra = [c for c in cand.columns if c not in ("s1_idx", "r_idx", "name_cos", "addr_cos")]
+    for c in extra:  # multi-channel blocker: fused score, channel count, per-channel ranks
+        C[c] = cand[c].to_numpy(np.float32)
+    if "rrf" in extra:
+        add_context(C, cand, score_col="rrf")
     return C
 
 

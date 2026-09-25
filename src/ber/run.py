@@ -18,6 +18,7 @@ import pandas as pd
 from sklearn.model_selection import GroupKFold
 
 from .blocking import generate_candidates
+from .channels import retrieve
 from .config import SEED
 from .features import context_features, pair_features, string_features
 from .io import read_ground_truth, write_id_lists
@@ -27,7 +28,7 @@ from .postprocess import select, tune_threshold
 from .prepare import load_prepared
 
 PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=127, min_data_in_leaf=100,
-              feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
+              feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0, max_bin=63,
               seed=SEED, verbose=-1, num_threads=0)
 
 
@@ -45,8 +46,11 @@ def stage_candidates(args, split):
     if pc.exists():
         cand = pd.read_parquet(pc)
     else:
-        cand = generate_candidates(s1, s23, k_comb=args.k_comb, k_name=args.k_name, df_cap=args.df_cap,
-                                   chunk=args.block_chunk, log=log)
+        if args.channels:
+            cand = retrieve(s1, s23, args.channels.split(","), m=args.rrf_m, df_cap=args.df_cap, log=log)
+        else:
+            cand = generate_candidates(s1, s23, k_comb=args.k_comb, k_name=args.k_name, df_cap=args.df_cap,
+                                       chunk=args.block_chunk, log=log)
         cand.to_parquet(pc, index=False)
     log(f"{split}: {len(cand)} candidate pairs ({len(cand) / len(s1):.1f}/S1)")
     return s1, s23, cand
@@ -70,13 +74,13 @@ def stage_train(args):
     return s1, s23, cand, F, s1["entity_id"].to_numpy()[s1_keep]
 
 
-def train_lgb(X, y, Xv=None, yv=None, rounds=2000):
+def train_lgb(X, y, Xv=None, yv=None, rounds=1500):
     dtr = lgb.Dataset(X, y, free_raw_data=True)
     if Xv is None:
         return lgb.train(PARAMS, dtr, num_boost_round=rounds)
     dv = lgb.Dataset(Xv, yv, reference=dtr)
     return lgb.train(PARAMS, dtr, num_boost_round=rounds, valid_sets=[dv],
-                     callbacks=[lgb.early_stopping(100, verbose=False)])
+                     callbacks=[lgb.early_stopping(50, verbose=False)])
 
 
 def cmd_cv(args):
@@ -178,8 +182,16 @@ def main():
     ap.add_argument("--df-cap", type=int, default=2000)
     ap.add_argument("--cv-frac", type=float, default=1.0, help="fraction of train S1 used for CV/fit features")
     ap.add_argument("--block-chunk", type=int, default=2000)
+    ap.add_argument("--channels", default="", help="multi-channel blocker, e.g. base_wide,conj,bm25,name_noaddr,rescue "
+                                                    "(empty = legacy E003 blocker)")
+    ap.add_argument("--rrf-m", type=int, default=80, help="candidates kept per S1 after RRF (rescue pairs always kept)")
+    ap.add_argument("--lr", type=float, default=0.1, help="LightGBM learning rate (0.05 in E001-E003)")
     args = ap.parse_args()
-    args.block_tag = f"k{args.k_comb}_n{args.k_name}_df{args.df_cap}"
+    PARAMS["learning_rate"] = args.lr
+    if args.channels:
+        args.block_tag = f"ch-{args.channels.replace(',', '+')}_m{args.rrf_m}_df{args.df_cap}"
+    else:
+        args.block_tag = f"k{args.k_comb}_n{args.k_name}_df{args.df_cap}"
     {"cv": cmd_cv, "fit": cmd_fit, "predict": cmd_predict}[args.cmd](args)
 
 
