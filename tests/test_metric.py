@@ -29,3 +29,12 @@ def test_perfect_and_precision_weight():
 def test_macro_missing_prediction_is_empty():
     truth = {"S1-1": {"S2-1"}, "S1-2": set()}
     assert macro_f05({}, truth) == 0.5
+
+
+def test_expected_f_mask_prefers_empty_for_weak_candidates():
+    import numpy as np
+    from ber.postprocess import expected_f_mask
+    s1 = np.array([0, 0, 0, 1, 1])
+    p = np.array([0.95, 0.9, 0.05, 0.05, 0.02])
+    keep = expected_f_mask(s1, p)
+    assert keep.tolist() == [True, True, False, False, False]

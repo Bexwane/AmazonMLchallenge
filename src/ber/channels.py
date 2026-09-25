@@ -169,6 +169,30 @@ def _pool_conj(pool, df_cap):
     return B.T.tocsr(), idf
 
 
+def pair_conj_cos(cand, s1, s23, df_cap=500, chunk=1_000_000, log=print):
+    """Cosine of the conjunction-key vectors for given (s1_idx, r_idx) pairs, with IDF from the full
+    S2/S3 pool of each country (same weighting as the `conj` channel). Used as a pair feature."""
+    out = np.zeros(len(cand), np.float32)
+    qi, ri = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
+    cc, rc = s1["country"].to_numpy()[qi], s23["country"].to_numpy()
+    for country in pd.unique(cc):
+        rows = np.flatnonzero(cc == country)
+        ib = np.flatnonzero(rc == country)
+        B0 = conj_matrix(s23.iloc[ib])
+        idf = _idf(B0, df_cap)
+        ur, inv_r = np.unique(np.searchsorted(ib, ri[rows]), return_inverse=True)
+        B = _apply(B0[ur], idf)
+        del B0
+        us, inv_s = np.unique(qi[rows], return_inverse=True)
+        A = _apply(conj_matrix(s1.iloc[us]), idf)
+        for a in range(0, len(rows), chunk):
+            sl = slice(a, a + chunk)
+            out[rows[sl]] = np.asarray(A[inv_s[sl]].multiply(B[inv_r[sl]]).sum(1)).ravel()
+        log(f"  conj_cos {country}: {len(rows)} pairs")
+        del A, B
+    return out
+
+
 def conj(q, pool, k=50, df_cap=500):
     Bt, idf = _memo(("conj", df_cap), lambda: _pool_conj(pool, df_cap))
     return sparse_topk(_apply(conj_matrix(q), idf), Bt, k)
