@@ -9,11 +9,21 @@ def owner_map(truth: dict) -> dict:
     return {x: s1 for s1, ids in truth.items() for x in ids}
 
 
+def owner_index(s1: pd.DataFrame, s23: pd.DataFrame, truth: dict) -> np.ndarray:
+    """Positional index into s1 of the entity owning each S2/S3 record (-1 = distractor)."""
+    a = [(k, x) for k, v in truth.items() for x in v]
+    own = np.full(len(s23), -1, np.int64)
+    r_pos = pd.Index(s23["entity_id"]).get_indexer([x for _, x in a])
+    s_pos = pd.Index(s1["entity_id"]).get_indexer([k for k, _ in a])
+    ok = (r_pos >= 0) & (s_pos >= 0)
+    own[r_pos[ok]] = s_pos[ok]
+    return own
+
+
 def label_pairs(cand: pd.DataFrame, s1: pd.DataFrame, s23: pd.DataFrame, truth: dict) -> np.ndarray:
-    own = owner_map(truth)
-    s1_ids = s1["entity_id"].to_numpy()[cand["s1_idx"].to_numpy()]
-    r_owner = s23["entity_id"].map(own).to_numpy()[cand["r_idx"].to_numpy()]
-    return (r_owner == s1_ids).astype(np.int8)
+    """1 if the S2/S3 record of the pair belongs to the pair's Source-1 entity (integer arrays only)."""
+    own = owner_index(s1, s23, truth)
+    return (own[cand["r_idx"].to_numpy()] == cand["s1_idx"].to_numpy()).astype(np.int8)
 
 
 def blocking_report(cand: pd.DataFrame, y: np.ndarray, s1: pd.DataFrame, s23: pd.DataFrame, truth: dict,

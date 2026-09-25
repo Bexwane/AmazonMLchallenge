@@ -1,6 +1,6 @@
 {
-  "updated": "2026-09-25T13:20",
-  "phase": "Full-density runs E001-E003 show blocking recall ~86% (gate 98%); E004 recall probe across retrieval channels",
+  "updated": "2026-09-25T17:10",
+  "phase": "Blocker selected (E007, all-S1 recall 0.9818, oracle 0.9942). Next: E008 cheap holdout E003 vs E007, one CV, fit, test predict",
   "official_metric": "macro F0.5 per Source-1 entity (singletons included)",
   "best_cv": {
     "value": 0.8926,
@@ -13,7 +13,7 @@
   },
   "best_public_lb": null,
   "champion": null,
-  "candidate": "20260925-E004 (recall probe: pick channels for the union blocker)",
+  "candidate": "20260925-E008-E007 (holdout -> CV once -> fit -> predict)",
   "compute": {
     "local": "i5-10210U, 16 GB RAM (~2.4 GB free), MX130 2 GB: smoke tests only",
     "team": [
@@ -23,9 +23,9 @@
     ]
   },
   "critical_risks": [
-    "blocking recall 86% at full density caps oracle macro F0.5 at 0.933; top-10 needs >= 0.97",
-    "India recall 79% (native script, dense tokens)",
-    "CV runtime 8h16m: LightGBM on 28M rows x 5 folds dominates; must cut before adding pairs",
+    "no model trained on the E007 candidate set yet: downstream macro F0.5 unmeasured",
+    "E007 blocking peaks at 27 GiB of 30: always run blocking in its own process (ber.run block)",
+    "BGE-M3 channel needs a GPU session for test blocking",
     "France unseen in train; stress-CV proxy only",
     "test has 5.76 S2+S3 per S1 vs 4.68 in train: possible precision drop"
   ],
@@ -34,5 +34,14 @@
     "rank3": 0.978934,
     "rank10": 0.969,
     "as_of": "2026-09-25"
+  },
+  "best_blocker": {
+    "exp": "E007-fullblock",
+    "spec": "base,conj:20,bm25:5,bge_native:5,name_noaddr:5",
+    "pair_recall": 0.9818,
+    "pairs": 145218172,
+    "oracle_macro_f05": 0.9942,
+    "peak_gib": 27.07,
+    "block_min": 95.9
   }
 }

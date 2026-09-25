@@ -1,0 +1,98 @@
+{
+ "pairs": 104293506,
+ "pairs_per_s1": 47.259612809557275,
+ "pair_recall": 0.8610163300654001,
+ "recall_India": 0.7933246901883528,
+ "recall_US": 0.9062549005989269,
+ "recall_S2": 0.8561280955074143,
+ "recall_S3": 0.8655933740727539,
+ "recall@1": 0.2448279180164865,
+ "recall@3": 0.5835695204405655,
+ "recall@5": 0.7292408781198594,
+ "recall@10": 0.7985792771096956,
+ "recall@20": 0.8292248406563446,
+ "recall@30": 0.8429443997504702,
+ "oracle_macro_f05": 0.933815055850079,
+ "blocker": "E003-style k_comb=45 k_name=10 df_cap=2500",
+ "cache": "/kaggle/working/work/train/cand_k45_n10_df2500.parquet",
+ "from_cache": false,
+ "block_min": 11.7,
+ "total_min": 17.6,
+ "peak_gib_after_blocking": {
+  "self": 21.2,
+  "children": 0.21
+ },
+ "presence": [
+  {
+   "bucket": "absent from candidate set",
+   "true_pairs": 1061608,
+   "share": 0.13898366993459987,
+   "share_India": 0.2066753098116472,
+   "share_US": 0.0937450994010731
+  },
+  {
+   "bucket": "present, rank 1-10",
+   "true_pairs": 6099840,
+   "share": 0.7985792771096956,
+   "share_India": 0.72129223623565,
+   "share_US": 0.8502304892277465
+  },
+  {
+   "bucket": "present, rank 11-20",
+   "true_pairs": 234082,
+   "share": 0.030645563546649053,
+   "share_India": 0.0310679338776532,
+   "share_US": 0.0303632919094852
+  },
+  {
+   "bucket": "present, rank 21-30",
+   "true_pairs": 104795,
+   "share": 0.01371955909412551,
+   "share_India": 0.015666163263932168,
+   "share_US": 0.012418636407120027
+  },
+  {
+   "bucket": "present, rank > 30",
+   "true_pairs": 138040,
+   "share": 0.01807193031492996,
+   "share_India": 0.025298356811117435,
+   "share_US": 0.013242483054575253
+  },
+  {
+   "bucket": "present but outside top-10",
+   "true_pairs": 476917,
+   "share": 0.06243705295570453,
+   "share_India": 0.0720324539527028,
+   "share_US": 0.05602441137118048
+  },
+  {
+   "bucket": "present but outside top-20",
+   "true_pairs": 242835,
+   "share": 0.03179148940905547,
+   "share_India": 0.0409645200750496,
+   "share_US": 0.025661119461695282
+  },
+  {
+   "bucket": "present but outside top-30",
+   "true_pairs": 138040,
+   "share": 0.01807193031492996,
+   "share_India": 0.025298356811117435,
+   "share_US": 0.013242483054575253
+  }
+ ],
+ "absent": 1061608,
+ "true_pairs": 7638365,
+ "absent_no_key": 0.181421956126932,
+ "rank_sample": 11303,
+ "absent_rank_quantiles": {
+  "0.1": 2.0,
+  "0.25": 49.0,
+  "0.5": 84.0,
+  "0.75": 257.0,
+  "0.9": 747.0
+ },
+ "peak_gib": {
+  "self": 21.2,
+  "children": 0.21
+ }
+}

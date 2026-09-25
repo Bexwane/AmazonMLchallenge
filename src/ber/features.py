@@ -28,11 +28,6 @@ def _num_features(n1, n2):
     return jac, first_eq
 
 
-def _group_rank(values, groups, ascending=False):
-    s = pd.Series(values if ascending else -values)
-    return s.groupby(groups).rank(method="min").to_numpy(np.float32)
-
-
 def string_features(cand: pd.DataFrame, s1: pd.DataFrame, s23: pd.DataFrame, workers=-1, chunk=2_000_000) -> pd.DataFrame:
     """Name/address similarity features for every row of `cand` (index is preserved)."""
     parts = []
@@ -74,37 +69,54 @@ def string_features(cand: pd.DataFrame, s1: pd.DataFrame, s23: pd.DataFrame, wor
     return pd.concat(parts, ignore_index=True).set_axis(cand.index)
 
 
-def context_features(cand: pd.DataFrame) -> pd.DataFrame:
-    """Blocking scores plus rank/gap features. Must see ALL candidate pairs of the split, because the
-    per-S2/S3 ranks measure competition between Source-1 records."""
-    C = pd.DataFrame({"name_cos": cand["name_cos"].to_numpy(np.float32),
-                      "addr_cos": cand["addr_cos"].to_numpy(np.float32)}, index=cand.index)
-    add_context(C, cand)
+def _rank_gap(score, group):
+    """Per-group rank (1 = best, ties share the lowest rank, like pandas rank(method='min')) and
+    gap to the group maximum, computed with one lexsort (much lighter than pandas groupby at 1e8 rows)."""
+    order = np.lexsort((-score, group))
+    g, s = group[order], score[order]
+    idx = np.arange(len(order), dtype=np.int32 if len(order) < 2 ** 31 else np.int64)
+    new_g = np.ones(len(order), bool)
+    new_g[1:] = g[1:] != g[:-1]
+    new_v = new_g.copy()
+    new_v[1:] |= s[1:] != s[:-1]
+    g_start = np.maximum.accumulate(np.where(new_g, idx, 0))
+    v_start = np.maximum.accumulate(np.where(new_v, idx, 0))
+    rank = np.empty(len(order), np.float32)
+    gap = np.empty(len(order), np.float32)
+    rank[order] = (v_start - g_start + 1).astype(np.float32)
+    gap[order] = s - s[g_start]
+    return rank, gap
+
+
+def context_features(cand: pd.DataFrame, rows=None) -> pd.DataFrame:
+    """Blocking scores plus rank/gap features. Ranks are computed over ALL candidate pairs of the split
+    (the per-S2/S3 ranks measure competition between Source-1 records); only the rows selected by the
+    boolean mask `rows` are returned, so the full-length feature matrix never exists."""
+    sel = slice(None) if rows is None else np.flatnonzero(rows)
+    g1, g2 = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
+    name, addr = cand["name_cos"].to_numpy(np.float32), cand["addr_cos"].to_numpy(np.float32)
+    C = {"name_cos": name[sel], "addr_cos": addr[sel]}
+    scores = {"comb": name + addr}
     extra = [c for c in cand.columns if c not in ("s1_idx", "r_idx", "name_cos", "addr_cos")]
     for c in extra:  # multi-channel blocker: fused score, channel count, per-channel ranks
-        C[c] = cand[c].to_numpy(np.float32)
+        C[c] = cand[c].to_numpy(np.float32)[sel]
     if "rrf" in extra:
-        add_context(C, cand, score_col="rrf")
-    return C
+        scores["rrf"] = cand["rrf"].to_numpy(np.float32)
+    for name_, sc in scores.items():
+        if name_ == "comb":
+            C["comb"] = sc[sel]
+        for side, g in (("s1", g1), ("r", g2)):
+            rank, gap = _rank_gap(sc, g)
+            C[f"{name_}_rank_{side}"], C[f"{name_}_gap_{side}"] = rank[sel], gap[sel]
+            del rank, gap
+    for side, g in (("s1", g1), ("r", g2)):
+        C[f"n_cand_{side}"] = np.bincount(g)[g][sel].astype(np.float32)
+    index = cand.index if rows is None else cand.index[sel]
+    return pd.DataFrame(C, index=index)
 
 
 def pair_features(cand: pd.DataFrame, s1: pd.DataFrame, s23: pd.DataFrame, rows=None, workers=-1) -> pd.DataFrame:
     """Full feature matrix for `cand` rows selected by the boolean mask `rows` (default all)."""
-    C = context_features(cand)
+    C = context_features(cand, rows)
     sub = cand if rows is None else cand[rows]
-    return pd.concat([string_features(sub, s1, s23, workers), C.loc[sub.index]], axis=1)
-
-
-def add_context(F: pd.DataFrame, cand: pd.DataFrame, score_col="comb"):
-    """Rank/gap features of a score within each S1's candidate list and each S2/S3 record's S1 list."""
-    if score_col == "comb":
-        F["comb"] = F["name_cos"] + F["addr_cos"]
-    sc = F[score_col].to_numpy(np.float32)
-    g1, g2 = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
-    F[f"{score_col}_rank_s1"] = _group_rank(sc, g1)
-    F[f"{score_col}_gap_s1"] = sc - pd.Series(sc).groupby(g1).transform("max").to_numpy(np.float32)
-    F[f"{score_col}_rank_r"] = _group_rank(sc, g2)
-    F[f"{score_col}_gap_r"] = sc - pd.Series(sc).groupby(g2).transform("max").to_numpy(np.float32)
-    if score_col == "comb":
-        F["n_cand_s1"] = pd.Series(g1).map(pd.Series(g1).value_counts()).to_numpy(np.float32)
-        F["n_cand_r"] = pd.Series(g2).map(pd.Series(g2).value_counts()).to_numpy(np.float32)
+    return pd.concat([string_features(sub, s1, s23, workers), C], axis=1)
