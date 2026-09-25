@@ -48,10 +48,15 @@ def _hash(key_lists):
     return hv.transform(key_lists).tocsr()
 
 
-def key_matrices(df: pd.DataFrame):
-    nk = [name_keys(r) for r in zip(df["name_core"], df["name_skel"], df["name_compact"], df["name_alias"])]
-    ak = [addr_keys(r) for r in zip(df["addr_alpha"], df["addr_nums"], df["addr_skel"])]
-    return _hash(nk), _hash(ak)
+def key_matrices(df: pd.DataFrame, chunk=500_000):
+    """Hashed binary (name, address) key matrices, built in chunks to bound peak memory."""
+    nc = [df[c].tolist() for c in ("name_core", "name_skel", "name_compact", "name_alias")]
+    ac = [df[c].tolist() for c in ("addr_alpha", "addr_nums", "addr_skel")]
+    N, A = [], []
+    for s in range(0, len(df), chunk):
+        N.append(_hash([name_keys(r) for r in zip(*(c[s:s + chunk] for c in nc))]))
+        A.append(_hash([addr_keys(r) for r in zip(*(c[s:s + chunk] for c in ac))]))
+    return sp.vstack(N).tocsr(), sp.vstack(A).tocsr()
 
 
 def _weight(A, B, df_cap):

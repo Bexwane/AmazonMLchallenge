@@ -1,18 +1,38 @@
 {
-  "updated": "2026-09-25T01:05",
-  "phase": "T0 autopsy done; baseline pipeline built; awaiting first full-density run",
+  "updated": "2026-09-25T13:20",
+  "phase": "Full-density runs E001-E003 show blocking recall ~86% (gate 98%); E004 recall probe across retrieval channels",
   "official_metric": "macro F0.5 per Source-1 entity (singletons included)",
-  "best_cv": {"value": 0.9887, "exp": "20260925-dev-lgb-v1c", "note": "1% universe, optimistic"},
-  "best_stress_cv": {"holdout_India": 0.9787, "holdout_US": 0.9904},
+  "best_cv": {
+    "value": 0.8926,
+    "exp": "20260925-E001-lgb-v1",
+    "note": "full density, cv-frac 0.3"
+  },
+  "best_stress_cv": {
+    "holdout_India": 0.7667,
+    "holdout_US": 0.8916
+  },
   "best_public_lb": null,
   "champion": null,
-  "candidate": "20260925-E001-lgb-v1 (full data, not yet run)",
-  "compute": {"local": "i5-10210U, 16 GB RAM (~2.4 GB free), MX130 2 GB: smoke tests only",
-              "team": ["MacBook M2 Pro", "Kaggle free (30 GB RAM, 4 CPU, 12 h)", "Colab free (~12 GB RAM)"]},
+  "candidate": "20260925-E004 (recall probe: pick channels for the union blocker)",
+  "compute": {
+    "local": "i5-10210U, 16 GB RAM (~2.4 GB free), MX130 2 GB: smoke tests only",
+    "team": [
+      "MacBook M2 Pro",
+      "Kaggle free (30 GB RAM, 4 CPU, 12 h)",
+      "Colab free (~12 GB RAM)"
+    ]
+  },
   "critical_risks": [
-    "full-density blocking recall unknown (dev 99.3% at 41 pairs/S1)",
+    "blocking recall 86% at full density caps oracle macro F0.5 at 0.933; top-10 needs >= 0.97",
+    "India recall 79% (native script, dense tokens)",
+    "CV runtime 8h16m: LightGBM on 28M rows x 5 folds dominates; must cut before adding pairs",
     "France unseen in train; stress-CV proxy only",
-    "test has 5.76 S2+S3 per S1 vs 4.68 in train: possible precision drop",
-    "submission count limits and deadline not yet confirmed"
-  ]
+    "test has 5.76 S2+S3 per S1 vs 4.68 in train: possible precision drop"
+  ],
+  "leaderboard_context": {
+    "rank1": 0.980473,
+    "rank3": 0.978934,
+    "rank10": 0.969,
+    "as_of": "2026-09-25"
+  }
 }
