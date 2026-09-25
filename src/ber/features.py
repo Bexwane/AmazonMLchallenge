@@ -138,6 +138,50 @@ def context_arrays(cols, rows=None) -> dict:
     return C
 
 
+def context2_arrays(s1_idx, r_idx, name_cos, addr_cos, rows=None) -> dict:
+    """v4 context. France (test only) has 3x more Source-1 entities sharing one address than train
+    (15.5% vs 5%): there only the name separates them. For each pair: rank/gap of the name score among
+    the S1's candidates and among the S2/S3 record's competing S1s, the address rank/gap on the S2/S3
+    side, and how many competing S1s are tied with the best address. Stored as float16 (train and test
+    alike) to keep the 1e8-row test table small; values are identical after the float32 cast."""
+    sel = slice(None) if rows is None else np.flatnonzero(rows)
+    name_cos, addr_cos = np.asarray(name_cos, np.float32), np.asarray(addr_cos, np.float32)
+    C = {}
+    for nm, sc, sides in (("name", name_cos, (("s1", s1_idx), ("r", r_idx))), ("addr", addr_cos, (("r", r_idx),))):
+        for side, g in sides:
+            rank, gap = _rank_gap(sc, g)
+            C[f"{nm}_rank_{side}"] = np.minimum(rank[sel], 2048).astype(np.float16)
+            C[f"{nm}_gap_{side}"] = gap[sel].astype(np.float16)
+            if nm == "addr":
+                ties = np.bincount(g, weights=(gap >= -0.02)).astype(np.float32)
+                C["addr_ties_r"] = np.minimum(ties[g[sel]], 2048).astype(np.float16)
+            del rank, gap
+    return C
+
+
+def crowd_arrays(s1: pd.DataFrame, s23: pd.DataFrame):
+    """Per-record counts of Source-1 entities with exactly this normalized address, plus address codes
+    for an exact-equality pair flag. Empty addresses get count 0 and code -1."""
+    a1, a23 = s1["addr_clean"].to_numpy(object), s23["addr_clean"].to_numpy(object)
+    codes, uniq = pd.factorize(np.concatenate([a1, a23]))
+    empty = np.flatnonzero(uniq == "")
+    if len(empty):
+        codes[codes == empty[0]] = -1
+    c1, c23 = codes[:len(a1)], codes[len(a1):]
+    cnt = np.bincount(c1[c1 >= 0], minlength=len(uniq)).astype(np.float32)
+    dup1 = np.where(c1 >= 0, cnt[np.maximum(c1, 0)], 0).astype(np.float32)
+    dup23 = np.where(c23 >= 0, cnt[np.maximum(c23, 0)], 0).astype(np.float32)
+    return {"c1": c1.astype(np.int32), "c23": c23.astype(np.int32), "dup1": dup1, "dup23": dup23}
+
+
+def crowd_features(s1_idx, r_idx, A) -> pd.DataFrame:
+    """l_addr_dup: S1 entities sharing this S1's address; r_addr_dup: S1 entities with the S2/S3 record's
+    address; a_exact: normalized addresses identical (non-empty)."""
+    c1, c23 = A["c1"][s1_idx], A["c23"][r_idx]
+    return pd.DataFrame({"l_addr_dup": A["dup1"][s1_idx], "r_addr_dup": A["dup23"][r_idx],
+                         "a_exact": ((c1 == c23) & (c1 >= 0)).astype(np.float32)})
+
+
 def context_features(cand: pd.DataFrame, rows=None) -> pd.DataFrame:
     """DataFrame form of `context_arrays` (use only when the selected rows fit comfortably in memory)."""
     C = context_arrays({c: cand[c].to_numpy() for c in cand.columns}, rows)

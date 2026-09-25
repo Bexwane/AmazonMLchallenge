@@ -26,8 +26,8 @@ from .blocking import generate_candidates
 from .buckets import assign_modes, name_frequency, pair_table
 from .channels import pair_conj_cos, retrieve
 from .config import SEED
-from .features import (context_arrays, context_columns, context_features, extra_features, pair_features,
-                       string_features)
+from .features import (context2_arrays, context_arrays, context_columns, context_features, crowd_arrays,
+                       crowd_features, extra_features, pair_features, string_features)
 from .io import read_ground_truth, write_grouped
 from .labels import blocking_report, label_pairs
 from .metric import breakdown
@@ -81,9 +81,23 @@ def stage_train(args):
         F.to_parquet(pf, index=False)
         log(f"train: features built in {(time.time() - t) / 60:.1f} min")
     args.ctx_cols = context_columns(cand)
+    X4 = None
+    if args.feat == "v4":  # name/address competition + shared-address counts (see features.context2_arrays)
+        p4 = Path(args.work) / "train" / f"featx4_{args.block_tag}_f{args.cv_frac:g}.parquet"
+        if p4.exists():
+            X4 = pd.read_parquet(p4)
+        else:
+            t = time.time()
+            si, ri = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
+            C2 = context2_arrays(si, ri, cand["name_cos"].to_numpy(), cand["addr_cos"].to_numpy(), rows)
+            X4 = pd.DataFrame({k: v.astype(np.float32) for k, v in C2.items()})
+            del C2
+            X4 = pd.concat([X4, crowd_features(si[rows], ri[rows], crowd_arrays(s1, s23))], axis=1)
+            X4.to_parquet(p4, index=False)
+            log(f"train: v4 features built in {(time.time() - t) / 60:.1f} min")
     cand = cand.loc[rows, ["s1_idx", "r_idx", "name_cos", "addr_cos"]].reset_index(drop=True)
     gc.collect()
-    if args.feat == "v3":  # extra pair features, cached separately so the v2 matrix is reused
+    if args.feat in ("v3", "v4"):  # extra pair features, cached separately so the v2 matrix is reused
         px = Path(args.work) / "train" / f"featx3_{args.block_tag}_f{args.cv_frac:g}.parquet"
         if px.exists():
             X = pd.read_parquet(px)
@@ -94,6 +108,8 @@ def stage_train(args):
             X.to_parquet(px, index=False)
             log(f"train: v3 features built in {(time.time() - t) / 60:.1f} min")
         F = pd.concat([F, X], axis=1)
+    if X4 is not None:
+        F = pd.concat([F, X4], axis=1)
     log(f"train: features {F.shape} for {int(s1_keep.sum())} sampled S1")
     return s1, s23, cand, F, s1["entity_id"].to_numpy()[s1_keep]
 
@@ -355,6 +371,11 @@ def cmd_predict(args):
     del cols
     gc.collect()
     ctx_cols = list(C)
+    A = None
+    if "name_rank_r" in names:  # v4 (float16 until each chunk is cast, as in training)
+        C.update(context2_arrays(cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy(), C["name_cos"], C["addr_cos"]))
+        A = crowd_arrays(s1, s23)
+        gc.collect()
     if "conj_cos" in names:
         C["conj_cos"] = pair_conj_cos(cand, s1, s23, log=log)
     p1 = np.empty(len(cand), np.float32)
@@ -364,7 +385,9 @@ def cmd_predict(args):
         parts = [string_features(sub, s1, s23)]
         if "a_num_tset" in names:
             parts.append(extra_features(sub, s1, s23))
-        parts.append(pd.DataFrame({k: v[a:a + step] for k, v in C.items()}, index=sub.index))
+        parts.append(pd.DataFrame({k: np.asarray(v[a:a + step], np.float32) for k, v in C.items()}, index=sub.index))
+        if A is not None:
+            parts.append(crowd_features(sub["s1_idx"].to_numpy(), sub["r_idx"].to_numpy(), A).set_axis(sub.index))
         Fc = pd.concat(parts, axis=1)[names]
         p1[a:a + step] = np.mean([m.predict(Fc) for m in models], axis=0)
         del Fc, parts
@@ -460,7 +483,8 @@ def main():
     ap.add_argument("--rrf-m", type=int, default=0, help="optional cap per S1 after RRF (0 = keep the whole union; "
                                                          "rescue pairs are always kept)")
     ap.add_argument("--lr", type=float, default=0.1, help="LightGBM learning rate (0.05 in E001-E003)")
-    ap.add_argument("--feat", default="v2", choices=["v2", "v3"], help="v3 adds house-number and conj_cos features")
+    ap.add_argument("--feat", default="v2", choices=["v2", "v3", "v4"],
+                    help="v3 adds house-number and conj_cos features; v4 adds name/address competition and shared-address counts")
     ap.add_argument("--no-stress", dest="stress", action="store_false", help="skip the country-holdout stress models")
     ap.add_argument("--count-match", default="none", choices=["none", "unseen", "all"],
                     help="shift each test country's logits to the out-of-fold matches-per-S1 (unseen = new countries only)")
