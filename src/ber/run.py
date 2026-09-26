@@ -647,15 +647,18 @@ def write_selection(args, out, cand, p, s1, s23):
         p = p.copy()
         target = (sm or {}).get("selected_per_s1_oof") or cvm.get("selected_per_s1_oof")
         train_c = set(pd.read_parquet(Path(args.work) / "prepared" / "train" / "s1.parquet", columns=["country"])["country"])
+        scale = {k: float(v) for k, v in (kv.split("=") for kv in args.count_scale.split(",") if kv)}
+        info["count_scale"] = scale
         pc = s1c[cand["s1_idx"].to_numpy()]
         for c in sorted(set(s1c)):
             if args.count_match == "unseen" and c in train_c:
                 continue
             rows = np.flatnonzero(pc == c)
-            d = count_match_delta(cand.iloc[rows], p[rows], rule, target, int((s1c == c).sum()))
+            t_c = target * scale.get(c, 1.0)
+            d = count_match_delta(cand.iloc[rows], p[rows], rule, t_c, int((s1c == c).sum()))
             p[rows] = shift_logit(p[rows], d)
             info["delta"][c] = d
-            log(f"count match {c}: delta {d:+.3f} -> {target:.3f} selected per S1")
+            log(f"count match {c}: delta {d:+.3f} -> {t_c:.3f} selected per S1")
     s1_ids, r_ids = s1["entity_id"].to_numpy(), s23["entity_id"].to_numpy()
     keep = rule_mask(cand, p, rule)
     si, ri = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
@@ -719,6 +722,8 @@ def main():
     ap.add_argument("--dense-model", default="none", choices=["none", "e5s", "e5b", "bge"],
                     help="dense encoder for --feat v5 (none = v5 without dense cosines)")
     ap.add_argument("--no-stress", dest="stress", action="store_false", help="skip the country-holdout stress models")
+    ap.add_argument("--count-scale", default="", help="per-country factor on the count-matching target, e.g. "
+                                                        "France=0.97 (label-free probes for the unseen country)")
     ap.add_argument("--count-match", default="none", choices=["none", "unseen", "all"],
                     help="shift each test country's logits to the out-of-fold matches-per-S1 (unseen = new countries only)")
     ap.add_argument("--p1-from", default="", help="stack/predict: reuse this experiment's stage-1 OOF and test p1")
