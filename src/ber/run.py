@@ -181,12 +181,13 @@ def cmd_dense(args):
     dense_arrays(args, args.split, s1, s23, cols["s1_idx"], cols["r_idx"])
 
 
-def train_lgb(X, y, Xv=None, yv=None, rounds=1500, w=None, wv=None):
+def train_lgb(X, y, Xv=None, yv=None, rounds=1500, w=None, wv=None, params=None):
+    prm = {**PARAMS, **(params or {})}
     dtr = lgb.Dataset(X, y, weight=w, free_raw_data=True)
     if Xv is None:
-        return lgb.train(PARAMS, dtr, num_boost_round=rounds)
+        return lgb.train(prm, dtr, num_boost_round=rounds)
     dv = lgb.Dataset(Xv, yv, weight=wv, reference=dtr)
-    return lgb.train(PARAMS, dtr, num_boost_round=rounds, valid_sets=[dv],
+    return lgb.train(prm, dtr, num_boost_round=rounds, valid_sets=[dv],
                      callbacks=[lgb.early_stopping(50, verbose=False)])
 
 
@@ -377,16 +378,26 @@ def cmd_stack(args):
         decoy = (y == 0) & ~pd.Series(r_ids[cand["r_idx"].to_numpy()]).isin(owned).to_numpy()
         log(f"decoys: {int(decoy.sum())} of {int((y == 0).sum())} negative pairs; test-like weight {args.decoy_weight}")
 
+    sp = {}  # stage-2 capacity (E014): learning rate, leaves, several seeds averaged
+    if args.stack_lr:
+        sp["learning_rate"] = args.stack_lr
+    if args.stack_leaves:
+        sp["num_leaves"] = args.stack_leaves
+        sp["min_data_in_leaf"] = 50
+
     def fit_stage2(wt, tag):
         pr, its, mm = np.zeros(len(cand), np.float32), [], None
         for k in np.unique(folds):
             tr, va = np.flatnonzero(folds != k), np.flatnonzero(folds == k)
-            mm = train_lgb(X2.iloc[tr], y[tr], X2.iloc[va], y[va],
-                           w=None if wt is None else wt[tr], wv=None if wt is None else wt[va])
-            pr[va] = mm.predict(X2.iloc[va], num_iteration=mm.best_iteration)
-            mm.save_model(str(out / f"{tag}_f{k}.txt"), num_iteration=mm.best_iteration)
-            its.append(mm.best_iteration)
-            log(f"{tag} fold {k}: best_iter={mm.best_iteration}")
+            for j in range(args.stack_seeds):
+                mm = train_lgb(X2.iloc[tr], y[tr], X2.iloc[va], y[va],
+                               w=None if wt is None else wt[tr], wv=None if wt is None else wt[va],
+                               params={**sp, "seed": SEED + 101 * j})
+                pr[va] += mm.predict(X2.iloc[va], num_iteration=mm.best_iteration) / args.stack_seeds
+                name = f"{tag}_f{k}.txt" if args.stack_seeds == 1 else f"{tag}_f{k}s{j}.txt"
+                mm.save_model(str(out / name), num_iteration=mm.best_iteration)
+                its.append(mm.best_iteration)
+                log(f"{tag} fold {k} seed {j}: best_iter={mm.best_iteration}")
         return pr, its, mm
 
     p2, iters, m = fit_stage2(None, "stack")
@@ -412,8 +423,10 @@ def cmd_stack(args):
         testlike["chosen_variant"] = name
         use_stack = name != "stage1"
         if name == "stage2w":  # the weighted models become the stage-2 models used at test time
-            for k in np.unique(folds):
-                os.replace(out / f"stackw_f{k}.txt", out / f"stack_f{k}.txt")
+            for f in out.glob("stack_f*.txt"):
+                f.unlink()
+            for f in out.glob("stackw_f*.txt"):
+                os.replace(f, out / f.name.replace("stackw_", "stack_"))
             iters, m = iters_w, mw
             imp = pd.Series(m.feature_importance("gain"), index=X2.columns).sort_values(ascending=False)
         qa = _crossfit(p[ia], y_a, folds_a) if rule["method"] == "expf" else p[ia]
@@ -752,6 +765,9 @@ def main():
     ap.add_argument("--no-ctx", action="store_true",
                     help="stack/predict with --p1-from: pairs from that experiment's oof/test probabilities, "
                          "no candidate table (stage-2 features without candidate-table context)")
+    ap.add_argument("--stack-lr", type=float, default=0.0, help="stage-2 learning rate (0 = --lr)")
+    ap.add_argument("--stack-leaves", type=int, default=0, help="stage-2 num_leaves (0 = 127)")
+    ap.add_argument("--stack-seeds", type=int, default=1, help="stage-2 models per fold with different seeds, averaged")
     ap.add_argument("--decoy-weight", type=float, default=0.0,
                     help=">1: stage 2 also trained with this weight on negatives from records owned by no S1, and the model "
                          "and selection rule are chosen on a test-like out-of-fold set with that decoy density (~1.9)")
