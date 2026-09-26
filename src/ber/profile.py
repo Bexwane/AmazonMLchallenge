@@ -115,7 +115,9 @@ def profile_arrays(s1: pd.DataFrame, s23: pd.DataFrame) -> dict:
     return _MEMO[key]
 
 
-def profile_features(s1_idx, r_idx, PA) -> pd.DataFrame:
+def profile_features(s1_idx, r_idx, PA, amb=True) -> pd.DataFrame:
+    """Pair features from record profiles. amb=False leaves out the core-name ambiguity counts (stage 1 v5+
+    already has them under the same names)."""
     L, R = PA["L"], PA["R"]
     lm, rm = L["legal"][s1_idx], R["legal"][r_idx]
     ln, rn = L["noise"][s1_idx], R["noise"][r_idx]
@@ -127,7 +129,7 @@ def profile_features(s1_idx, r_idx, PA) -> pd.DataFrame:
     mag = np.where(both & (diff > 0), np.floor(np.log10(np.maximum(diff, 1))) + 1, 0).astype(np.float32)
     pub = np.uint32(BIT["PUB"])
     pl = np.uint32(BIT["PVT"] | BIT["LTD"])
-    return pd.DataFrame({
+    F = pd.DataFrame({
         "lg_l_n": _popcount(lm), "lg_r_n": _popcount(rm),
         "lg_add": _popcount(rm & ~lm), "lg_drop": _popcount(lm & ~rm),
         "lg_add_other": _popcount(rm & ~lm & ~pl),  # added form other than Private/Limited (noise-prone)
@@ -142,6 +144,7 @@ def profile_features(s1_idx, r_idx, PA) -> pd.DataFrame:
         "l_name_s1dup": PA["amb"]["l_name_s1dup"][s1_idx], "r_name_s1cnt": PA["amb"]["r_name_s1cnt"][r_idx],
         "r_name_s23cnt": PA["amb"]["r_name_s23cnt"][r_idx],
     })
+    return F if amb else F.drop(columns=["l_name_s1dup", "r_name_s1cnt", "r_name_s23cnt"])
 
 
 def profile_codes(PA) -> dict:

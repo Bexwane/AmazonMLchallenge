@@ -38,6 +38,7 @@ from .metric import breakdown
 from .postprocess import (apply_calibrator, count_match_delta, fit_calibrator, rule_mask, select, select_rule,
                           selection_study, shift_logit, tune_threshold)
 from .prepare import load_prepared
+from .profile import profile_arrays, profile_features
 from .stack import stack_features
 
 PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=127, min_data_in_leaf=100,
@@ -86,7 +87,7 @@ def stage_train(args):
         log(f"train: features built in {(time.time() - t) / 60:.1f} min")
     args.ctx_cols = context_columns(cand)
     X4 = None
-    if args.feat in ("v4", "v5"):  # name/address competition + shared-address counts (see features.context2_arrays)
+    if args.feat in ("v4", "v5", "v6"):  # name/address competition + shared-address counts (see features.context2_arrays)
         p4 = Path(args.work) / "train" / f"featx4_{args.block_tag}_f{args.cv_frac:g}.parquet"
         if p4.exists():
             X4 = pd.read_parquet(p4)
@@ -99,7 +100,7 @@ def stage_train(args):
             X4 = pd.concat([X4, crowd_features(si[rows], ri[rows], crowd_arrays(s1, s23))], axis=1)
             X4.to_parquet(p4, index=False)
             log(f"train: v4 features built in {(time.time() - t) / 60:.1f} min")
-    if args.feat == "v5":  # global name ambiguity (+ dense multilingual cosines unless --dense-model none)
+    if args.feat in ("v5", "v6"):  # global name ambiguity (+ dense multilingual cosines unless --dense-model none)
         pa = Path(args.work) / "train" / f"featx5a_{args.block_tag}_f{args.cv_frac:g}.parquet"
         if pa.exists():
             XA = pd.read_parquet(pa)
@@ -108,7 +109,7 @@ def stage_train(args):
             XA = name_amb_features(si[rows], ri[rows], name_amb_arrays(s1, s23)).reset_index(drop=True)
             XA.to_parquet(pa, index=False)
         X4 = pd.concat([X4, XA], axis=1)
-    if args.feat == "v5" and args.dense_model != "none":
+    if args.feat in ("v5", "v6") and args.dense_model != "none":
         p5 = Path(args.work) / "train" / f"featx5_{args.dense_model}_{args.block_tag}_f{args.cv_frac:g}.parquet"
         if p5.exists():
             X5 = pd.read_parquet(p5)
@@ -121,7 +122,18 @@ def stage_train(args):
         X4 = pd.concat([X4, X5], axis=1)
     cand = cand.loc[rows, ["s1_idx", "r_idx", "name_cos", "addr_cos"]].reset_index(drop=True)
     gc.collect()
-    if args.feat in ("v3", "v4", "v5"):  # extra pair features, cached separately so the v2 matrix is reused
+    if args.feat == "v6":  # legal-form / business-word / house-number profiles (see profile.py) at stage 1 too
+        p6 = Path(args.work) / "train" / f"featx6_{args.block_tag}_f{args.cv_frac:g}.parquet"
+        if p6.exists():
+            X6 = pd.read_parquet(p6)
+        else:
+            t = time.time()
+            si, ri = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
+            X6 = profile_features(si, ri, profile_arrays(s1, s23), amb=False).reset_index(drop=True)  # cand = sampled rows here
+            X6.to_parquet(p6, index=False)
+            log(f"train: v6 profile features built in {(time.time() - t) / 60:.1f} min")
+        X4 = pd.concat([X4, X6], axis=1)
+    if args.feat in ("v3", "v4", "v5", "v6"):  # extra pair features, cached separately so the v2 matrix is reused
         px = Path(args.work) / "train" / f"featx3_{args.block_tag}_f{args.cv_frac:g}.parquet"
         if px.exists():
             X = pd.read_parquet(px)
@@ -502,6 +514,7 @@ def cmd_predict(args):
         A = crowd_arrays(s1, s23)
         gc.collect()
     AN = name_amb_arrays(s1, s23) if "r_name_s1cnt" in names else None
+    PA = profile_arrays(s1, s23) if "lg_add" in names else None
     if "d_full" in names:  # v5 dense cosines (cached by `ber.run dense --split test`)
         si_, ri_ = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
         D = dense_arrays(args, "test", s1, s23, si_, ri_)
@@ -529,6 +542,8 @@ def cmd_predict(args):
             parts.append(crowd_features(sub["s1_idx"].to_numpy(), sub["r_idx"].to_numpy(), A).set_axis(sub.index))
         if AN is not None:
             parts.append(name_amb_features(sub["s1_idx"].to_numpy(), sub["r_idx"].to_numpy(), AN).set_axis(sub.index))
+        if PA is not None:
+            parts.append(profile_features(sub["s1_idx"].to_numpy(), sub["r_idx"].to_numpy(), PA, amb=False).set_axis(sub.index))
         Fc = pd.concat(parts, axis=1)[names]
         p1[a:a + step] = np.mean([m.predict(Fc) for m in models], axis=0)
         del Fc, parts
@@ -641,9 +656,10 @@ def main():
     ap.add_argument("--rrf-m", type=int, default=0, help="optional cap per S1 after RRF (0 = keep the whole union; "
                                                          "rescue pairs are always kept)")
     ap.add_argument("--lr", type=float, default=0.1, help="LightGBM learning rate (0.05 in E001-E003)")
-    ap.add_argument("--feat", default="v2", choices=["v2", "v3", "v4", "v5"],
+    ap.add_argument("--feat", default="v2", choices=["v2", "v3", "v4", "v5", "v6"],
                     help="v3 adds house-number and conj_cos features; v4 adds name/address competition and shared-address "
-                         "counts; v5 adds global name ambiguity and, with --dense-model, dense multilingual cosines")
+                         "counts; v5 adds global name ambiguity and, with --dense-model, dense multilingual cosines; "
+                         "v6 adds legal-form / business-word / house-number profiles")
     ap.add_argument("--dense-model", default="none", choices=["none", "e5s", "e5b", "bge"],
                     help="dense encoder for --feat v5 (none = v5 without dense cosines)")
     ap.add_argument("--no-stress", dest="stress", action="store_false", help="skip the country-holdout stress models")
