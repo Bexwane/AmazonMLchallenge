@@ -181,11 +181,11 @@ def cmd_dense(args):
     dense_arrays(args, args.split, s1, s23, cols["s1_idx"], cols["r_idx"])
 
 
-def train_lgb(X, y, Xv=None, yv=None, rounds=1500):
-    dtr = lgb.Dataset(X, y, free_raw_data=True)
+def train_lgb(X, y, Xv=None, yv=None, rounds=1500, w=None, wv=None):
+    dtr = lgb.Dataset(X, y, weight=w, free_raw_data=True)
     if Xv is None:
         return lgb.train(PARAMS, dtr, num_boost_round=rounds)
-    dv = lgb.Dataset(Xv, yv, reference=dtr)
+    dv = lgb.Dataset(Xv, yv, weight=wv, reference=dtr)
     return lgb.train(PARAMS, dtr, num_boost_round=rounds, valid_sets=[dv],
                      callbacks=[lgb.early_stopping(50, verbose=False)])
 
@@ -299,6 +299,21 @@ def cmd_holdout(args):
     log("HOLDOUT", json.dumps({k: v for k, v in res.items() if k.startswith(("val_B", "threshold", "best_iter"))}, indent=1))
 
 
+def _augment_decoys(cand, decoy, weight, n_r):
+    """Test-like out-of-fold set: test has ~1.9x the decoy records of train (records owned by no S1: twins,
+    noise). Each decoy pair gets weight-1 extra clones (a fractional part is sampled) as a new, unique
+    record, so selection, calibration and the metric see test's decoy density. Returns the row index into
+    `cand` of every augmented row and the augmented (s1_idx, r_idx) table."""
+    rng = np.random.default_rng(SEED + 7)
+    extra = np.flatnonzero(decoy)
+    reps = int(np.floor(weight - 1))
+    clones = np.concatenate([np.repeat(extra, reps), extra[rng.random(len(extra)) < weight - 1 - reps]])
+    idx = np.concatenate([np.arange(len(cand)), clones])
+    c = pd.DataFrame({"s1_idx": cand["s1_idx"].to_numpy()[idx],
+                      "r_idx": np.concatenate([cand["r_idx"].to_numpy(), n_r + np.arange(len(clones))]).astype(np.int64)})
+    return idx, c
+
+
 def _crossfit(p, y, folds):
     q = np.empty(len(p), np.float32)
     for k in np.unique(folds):
@@ -355,21 +370,61 @@ def cmd_stack(args):
     log(f"stack: features {X2.shape} in {(time.time() - t) / 60:.1f} min")
     del F
     gc.collect()
-    p2 = np.zeros(len(cand), np.float32)
-    iters = []
-    for k in np.unique(folds):
-        tr, va = np.flatnonzero(folds != k), np.flatnonzero(folds == k)
-        m = train_lgb(X2.iloc[tr], y[tr], X2.iloc[va], y[va])
-        p2[va] = m.predict(X2.iloc[va], num_iteration=m.best_iteration)
-        m.save_model(str(out / f"stack_f{k}.txt"), num_iteration=m.best_iteration)
-        iters.append(m.best_iteration)
-        log(f"stack fold {k}: best_iter={m.best_iteration}")
-    imp = pd.Series(m.feature_importance("gain"), index=X2.columns).sort_values(ascending=False)
     s1_ids, r_ids = s1["entity_id"].to_numpy(), s23["entity_id"].to_numpy()
+    decoy = None
+    if args.decoy_weight > 1:  # records owned by no S1 (twins, noise): ~1.9x denser in test than in train
+        owned = set().union(*read_ground_truth(Path(args.data) / "train" / "train_ground_truth.tsv").values())
+        decoy = (y == 0) & ~pd.Series(r_ids[cand["r_idx"].to_numpy()]).isin(owned).to_numpy()
+        log(f"decoys: {int(decoy.sum())} of {int((y == 0).sum())} negative pairs; test-like weight {args.decoy_weight}")
+
+    def fit_stage2(wt, tag):
+        pr, its, mm = np.zeros(len(cand), np.float32), [], None
+        for k in np.unique(folds):
+            tr, va = np.flatnonzero(folds != k), np.flatnonzero(folds == k)
+            mm = train_lgb(X2.iloc[tr], y[tr], X2.iloc[va], y[va],
+                           w=None if wt is None else wt[tr], wv=None if wt is None else wt[va])
+            pr[va] = mm.predict(X2.iloc[va], num_iteration=mm.best_iteration)
+            mm.save_model(str(out / f"{tag}_f{k}.txt"), num_iteration=mm.best_iteration)
+            its.append(mm.best_iteration)
+            log(f"{tag} fold {k}: best_iter={mm.best_iteration}")
+        return pr, its, mm
+
+    p2, iters, m = fit_stage2(None, "stack")
+    imp = pd.Series(m.feature_importance("gain"), index=X2.columns).sort_values(ascending=False)
     rule1, f1, tab1 = selection_study(cand, p1, y, s1_ids, r_ids, truth, eval_ids, folds, log=log)
     rule2, f2, tab2 = selection_study(cand, p2, y, s1_ids, r_ids, truth, eval_ids, folds, log=log)
     use_stack = f2 > f1 + 0.0005
     rule, p = (rule2, p2) if use_stack else (rule1, p1)
+    testlike = None
+    if decoy is not None:  # choose model + rule on the test-like (decoy-augmented) out-of-fold set
+        p2w, iters_w, mw = fit_stage2(np.where(decoy, args.decoy_weight, 1.0).astype(np.float32), "stackw")
+        ia, cand_a = _augment_decoys(cand, decoy, args.decoy_weight, len(r_ids))
+        r_ids_a = np.concatenate([r_ids.astype(object), np.array([f"DECOY-{i}" for i in range(len(ia) - len(cand))], object)])
+        y_a, folds_a = y[ia], folds[ia]
+        testlike = {"decoy_weight": args.decoy_weight, "decoy_pairs": int(decoy.sum()), "clones": int(len(ia) - len(cand))}
+        best = None
+        for name, pv in (("stage1", p1), ("stage2", p2), ("stage2w", p2w)):
+            r_, f_, t_ = selection_study(cand_a, pv[ia], y_a, s1_ids, r_ids_a, truth, eval_ids, folds_a, log=log)
+            testlike[name] = {"best": {k: v for k, v in r_.items() if k != "cal"}, "macro_f05": f_, "table": t_[:5]}
+            if best is None or f_ > best[1] + (0.0005 if name != "stage2w" else 0.0):
+                best = (name, f_, r_, pv)
+        name, _, rule, p = best
+        testlike["chosen_variant"] = name
+        use_stack = name != "stage1"
+        if name == "stage2w":  # the weighted models become the stage-2 models used at test time
+            for k in np.unique(folds):
+                os.replace(out / f"stackw_f{k}.txt", out / f"stack_f{k}.txt")
+            iters, m = iters_w, mw
+            imp = pd.Series(m.feature_importance("gain"), index=X2.columns).sort_values(ascending=False)
+        qa = _crossfit(p[ia], y_a, folds_a) if rule["method"] == "expf" else p[ia]
+        keep_a = rule_mask(cand_a, qa, {k: v for k, v in rule.items() if k != "cal"})
+        pred_a = {}
+        for a, b in zip(s1_ids[cand_a["s1_idx"].to_numpy()[keep_a]], r_ids_a[cand_a["r_idx"].to_numpy()[keep_a]]):
+            pred_a.setdefault(a, []).append(b)
+        testlike["chosen"] = breakdown(pred_a, truth, eval_ids)
+        testlike["selected_per_s1"] = float(keep_a.sum() / len(eval_ids))
+        log("test-like", json.dumps({k: (v["macro_f05"] if isinstance(v, dict) and "macro_f05" in v else v)
+                                     for k, v in testlike.items() if k != "chosen"}))
     q = _crossfit(p, y, folds) if rule["method"] == "expf" else p
     keep = rule_mask(cand, q, {k: v for k, v in rule.items() if k != "cal"})
     sel = cand[keep]
@@ -381,7 +436,8 @@ def cmd_stack(args):
                       "best_iters": iters},
            "use_stack": bool(use_stack), "rule": rule, "chosen": breakdown(pred, truth, eval_ids),
            "stack_feat": args.stack_feat, "prune": prune, "p1_from": args.p1_from,
-           "selected_per_s1_oof": float(keep.sum() / len(eval_ids)),
+           "selected_per_s1_oof": testlike["selected_per_s1"] if testlike else float(keep.sum() / len(eval_ids)),
+           "testlike": testlike,
            "stack_feature_gain_top": (imp / imp.sum()).round(4).head(25).to_dict()}
     ec = s1.set_index("entity_id").loc[eval_ids, "country"].to_numpy()
     for c in sorted(set(ec)):
@@ -669,6 +725,9 @@ def main():
     ap.add_argument("--no-ctx", action="store_true",
                     help="stack/predict with --p1-from: pairs from that experiment's oof/test probabilities, "
                          "no candidate table (stage-2 features without candidate-table context)")
+    ap.add_argument("--decoy-weight", type=float, default=0.0,
+                    help=">1: stage 2 also trained with this weight on negatives from records owned by no S1, and the model "
+                         "and selection rule are chosen on a test-like out-of-fold set with that decoy density (~1.9)")
     ap.add_argument("--stack-feat", default="v1", choices=["v1", "v2", "v3"],
                     help="v2 adds legal-form/word/house-number profiles; v3 also the S1-vs-record name/address similarities "
                          "(stage 1's string features: with --no-ctx stage 2 otherwise sees them only through p1)")
