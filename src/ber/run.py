@@ -338,7 +338,8 @@ def cmd_stack(args):
         else:
             log(f"prune skipped: blocking recall {rec_block:.4f} leaves no room above {args.min_cand_recall}")
     t = time.time()
-    X2 = stack_features(cand, p1, s23, F[args.ctx_cols], s1=s1 if args.stack_feat == "v2" else None)
+    X2 = stack_features(cand, p1, s23, F[args.ctx_cols], s1=s1 if args.stack_feat in ("v2", "v3") else None,
+                        pair=args.stack_feat == "v3")
     log(f"stack: features {X2.shape} in {(time.time() - t) / 60:.1f} min")
     del F
     gc.collect()
@@ -459,10 +460,11 @@ def _predict_from_p1(args, out):
     stack = _load_models(out, "stack") if sm["use_stack"] else []
     if stack:
         names2 = stack[0].feature_name()
-        prof = s1 if sm.get("stack_feat") == "v2" else None
+        prof = s1 if sm.get("stack_feat") in ("v2", "v3") else None
         p = np.empty(len(cand), np.float32)
         for rows in _s1_chunks(cand["s1_idx"].to_numpy()):
-            X2 = stack_features(cand.iloc[rows], p1[rows], s23, pd.DataFrame(index=range(len(rows))), s1=prof)[names2]
+            X2 = stack_features(cand.iloc[rows], p1[rows], s23, pd.DataFrame(index=range(len(rows))), s1=prof,
+                                pair=sm.get("stack_feat") == "v3")[names2]
             p[rows] = np.mean([m.predict(X2) for m in stack], axis=0)
             log(f"stage 2: {len(rows)} pairs")
     pd.DataFrame({"s1_idx": cand["s1_idx"], "r_idx": cand["r_idx"], "p1": p1, "p": p}).to_parquet(
@@ -543,11 +545,11 @@ def cmd_predict(args):
     stack = _load_models(out, "stack") if sm and sm["use_stack"] else []
     if stack:
         names2 = stack[0].feature_name()
-        prof = s1 if sm.get("stack_feat") == "v2" else None
+        prof = s1 if sm.get("stack_feat") in ("v2", "v3") else None
         p = np.empty(len(cand), np.float32)
         for rows in _s1_chunks(cand["s1_idx"].to_numpy()):
             Cc = pd.DataFrame({k: C[k][rows] for k in ctx_cols})
-            X2 = stack_features(cand.iloc[rows], p1[rows], s23, Cc, s1=prof)[names2]
+            X2 = stack_features(cand.iloc[rows], p1[rows], s23, Cc, s1=prof, pair=sm.get("stack_feat") == "v3")[names2]
             p[rows] = np.mean([m.predict(X2) for m in stack], axis=0)
             log(f"stage 2: {len(rows)} pairs")
     del C
@@ -651,7 +653,9 @@ def main():
     ap.add_argument("--no-ctx", action="store_true",
                     help="stack/predict with --p1-from: pairs from that experiment's oof/test probabilities, "
                          "no candidate table (stage-2 features without candidate-table context)")
-    ap.add_argument("--stack-feat", default="v1", choices=["v1", "v2"], help="v2 adds legal-form/word/house-number profiles")
+    ap.add_argument("--stack-feat", default="v1", choices=["v1", "v2", "v3"],
+                    help="v2 adds legal-form/word/house-number profiles; v3 also the S1-vs-record name/address similarities "
+                         "(stage 1's string features: with --no-ctx stage 2 otherwise sees them only through p1)")
     ap.add_argument("--prune-loss", type=float, default=0.0,
                     help="stack: drop pairs below the p1 quantile losing this share of true candidate pairs")
     ap.add_argument("--min-cand-recall", type=float, default=0.98, help="pruning never takes candidate recall below this")

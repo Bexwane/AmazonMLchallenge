@@ -149,10 +149,12 @@ def group_features(s1_idx: np.ndarray, r_idx: np.ndarray, p: np.ndarray, codes: 
     return pd.DataFrame(F)
 
 
-def stack_features(cand: pd.DataFrame, p: np.ndarray, s23: pd.DataFrame, C: pd.DataFrame, s1=None) -> pd.DataFrame:
+def stack_features(cand: pd.DataFrame, p: np.ndarray, s23: pd.DataFrame, C: pd.DataFrame, s1=None, pair=False) -> pd.DataFrame:
     """Stage-2 matrix: probability context + sibling agreement + group consensus + the (candidate-table)
     context features. With `s1` (E011): legal-form / business-word / house-number profile features and
-    groups by legal form and by full profile."""
+    groups by legal form and by full profile. With `pair` (v3, needs `s1`): the S1-vs-record name/address
+    similarities of stage 1, so stage 2 can combine them with the profiles (e.g. empty address + exact name +
+    name carried by one S1 only) instead of seeing them only through p1."""
     s1_idx, r_idx = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
     P = p_context(s1_idx, p)
     S = sibling_features(s1_idx, r_idx, p, s23)
@@ -163,5 +165,9 @@ def stack_features(cand: pd.DataFrame, p: np.ndarray, s23: pd.DataFrame, C: pd.D
         PA = profile_arrays(s1, s23)
         codes.update(profile_codes(PA))
         parts.append(profile_features(s1_idx, r_idx, PA))
+        if pair:
+            from .features import extra_features, string_features
+            parts.append(string_features(cand, s1, s23).reset_index(drop=True))
+            parts.append(extra_features(cand, s1, s23).reset_index(drop=True))
     parts.append(group_features(s1_idx, r_idx, p, codes))
     return pd.concat(parts + [C.reset_index(drop=True)], axis=1)
