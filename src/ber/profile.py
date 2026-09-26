@@ -109,8 +109,9 @@ def profile_arrays(s1: pd.DataFrame, s23: pd.DataFrame) -> dict:
     c1, c23 = codes[:len(k1)], codes[len(k1):]
     cnt = np.bincount(c1, minlength=codes.max() + 1).astype(np.float32)
     L["namelg_s1dup"], R["namelg_s1cnt"] = cnt[c1], cnt[c23]
+    from .features import name_amb_arrays
     _MEMO.clear()
-    _MEMO[key] = {"L": L, "R": R}
+    _MEMO[key] = {"L": L, "R": R, "amb": name_amb_arrays(s1, s23)}
     return _MEMO[key]
 
 
@@ -138,6 +139,8 @@ def profile_features(s1_idx, r_idx, PA) -> pd.DataFrame:
         "hn_diff_mag": mag, "hn_diff_lead": np.where(both, mag - la, 0).astype(np.float32),
         "hn_len_eq": (la == lb).astype(np.float32),
         "namelg_s1dup": L["namelg_s1dup"][s1_idx], "namelg_r_s1cnt": R["namelg_s1cnt"][r_idx],
+        "l_name_s1dup": PA["amb"]["l_name_s1dup"][s1_idx], "r_name_s1cnt": PA["amb"]["r_name_s1cnt"][r_idx],
+        "r_name_s23cnt": PA["amb"]["r_name_s23cnt"][r_idx],
     })
 
 

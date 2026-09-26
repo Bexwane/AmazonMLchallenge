@@ -296,10 +296,20 @@ def _crossfit(p, y, folds):
 
 def cmd_stack(args):
     """Stage 2 on the stage-1 out-of-fold probabilities (same folds), then choose the selection rule."""
-    s1, s23, cand, F, eval_ids = stage_train(args)
     out = Path(args.work) / "experiments" / args.exp
     out.mkdir(parents=True, exist_ok=True)
     O = pd.read_parquet(Path(args.work) / "experiments" / (args.p1_from or args.exp) / "oof.parquet")
+    if args.no_ctx:  # pairs come from the stage-1 source; no candidate table or stage-1 feature cache needed
+        s1, s23 = load_prepared(args.data, "train", args.work)
+        cand = O[["s1_idx", "r_idx"]].copy()
+        cand["name_cos"] = cand["addr_cos"] = np.float32(np.nan)  # only used by the error-sample report
+        s1_keep = np.random.default_rng(SEED).random(len(s1)) < args.cv_frac  # the stage_train sample
+        eval_ids = s1["entity_id"].to_numpy()[s1_keep]
+        F = pd.DataFrame(index=cand.index)
+        args.ctx_cols = []
+        log(f"stack: {len(cand)} pairs from {args.p1_from} (no candidate-table context)")
+    else:
+        s1, s23, cand, F, eval_ids = stage_train(args)
     assert np.array_equal(O["s1_idx"].to_numpy(), cand["s1_idx"].to_numpy()), "oof rows do not match the features"
     p1, y = O["oof"].to_numpy(np.float32), O["y"].to_numpy().astype(np.int8)
     if "fold" in O:
@@ -430,10 +440,42 @@ def _read_columns(path):
     return {c: pf.read(columns=[c]).column(0).to_numpy() for c in pf.schema_arrow.names}
 
 
+def _predict_from_p1(args, out):
+    """Stage 2 on another experiment's test p1 without the candidate table (--no-ctx)."""
+    s1, s23 = load_prepared(args.data, "test", args.work)
+    T = pd.read_parquet(Path(args.work) / "experiments" / args.p1_from / "test_pairs_proba.parquet",
+                        columns=["s1_idx", "r_idx", "p1"])
+    cand, p1 = T[["s1_idx", "r_idx"]], T["p1"].to_numpy(np.float32)
+    del T
+    log(f"test: {len(cand)} pairs with p1 from {args.p1_from}")
+    sm = json.loads((out / "stack_metrics.json").read_text())
+    if sm.get("prune") and sm["prune"].get("p1_min") is not None:
+        keep = np.flatnonzero(p1 >= sm["prune"]["p1_min"])
+        n0 = len(cand)
+        cand, p1 = cand.iloc[keep].reset_index(drop=True), p1[keep]
+        gc.collect()
+        log(f"prune: p1 >= {sm['prune']['p1_min']:.2e} keeps {len(cand)}/{n0} pairs ({len(cand) / len(s1):.1f}/S1)")
+    p = p1
+    stack = _load_models(out, "stack") if sm["use_stack"] else []
+    if stack:
+        names2 = stack[0].feature_name()
+        prof = s1 if sm.get("stack_feat") == "v2" else None
+        p = np.empty(len(cand), np.float32)
+        for rows in _s1_chunks(cand["s1_idx"].to_numpy()):
+            X2 = stack_features(cand.iloc[rows], p1[rows], s23, pd.DataFrame(index=range(len(rows))), s1=prof)[names2]
+            p[rows] = np.mean([m.predict(X2) for m in stack], axis=0)
+            log(f"stage 2: {len(rows)} pairs")
+    pd.DataFrame({"s1_idx": cand["s1_idx"], "r_idx": cand["r_idx"], "p1": p1, "p": p}).to_parquet(
+        out / "test_pairs_proba.parquet")
+    write_selection(args, out, cand, p, s1, s23)
+
+
 def cmd_predict(args):
     """Test prediction, memory-lean: the 1e8-row candidate table is kept as separate numpy columns and
     feature matrices are only built 4M rows at a time."""
     out = Path(args.work) / "experiments" / args.exp
+    if args.no_ctx:
+        return _predict_from_p1(args, out)
     if args.p1_from:  # E011: reuse another experiment's stage-1 test probabilities
         models, names = [], []
     else:
@@ -606,6 +648,9 @@ def main():
     ap.add_argument("--count-match", default="none", choices=["none", "unseen", "all"],
                     help="shift each test country's logits to the out-of-fold matches-per-S1 (unseen = new countries only)")
     ap.add_argument("--p1-from", default="", help="stack/predict: reuse this experiment's stage-1 OOF and test p1")
+    ap.add_argument("--no-ctx", action="store_true",
+                    help="stack/predict with --p1-from: pairs from that experiment's oof/test probabilities, "
+                         "no candidate table (stage-2 features without candidate-table context)")
     ap.add_argument("--stack-feat", default="v1", choices=["v1", "v2"], help="v2 adds legal-form/word/house-number profiles")
     ap.add_argument("--prune-loss", type=float, default=0.0,
                     help="stack: drop pairs below the p1 quantile losing this share of true candidate pairs")
