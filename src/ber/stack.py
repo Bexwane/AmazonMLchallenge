@@ -149,10 +149,19 @@ def group_features(s1_idx: np.ndarray, r_idx: np.ndarray, p: np.ndarray, codes: 
     return pd.DataFrame(F)
 
 
-def stack_features(cand: pd.DataFrame, p: np.ndarray, s23: pd.DataFrame, C: pd.DataFrame) -> pd.DataFrame:
-    """Stage-2 matrix: probability context + sibling agreement + the (candidate-table) context features."""
+def stack_features(cand: pd.DataFrame, p: np.ndarray, s23: pd.DataFrame, C: pd.DataFrame, s1=None) -> pd.DataFrame:
+    """Stage-2 matrix: probability context + sibling agreement + group consensus + the (candidate-table)
+    context features. With `s1` (E011): legal-form / business-word / house-number profile features and
+    groups by legal form and by full profile."""
     s1_idx, r_idx = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
     P = p_context(s1_idx, p)
     S = sibling_features(s1_idx, r_idx, p, s23)
-    G = group_features(s1_idx, r_idx, p, s23_codes(s23))
-    return pd.concat([P, S, G, C.reset_index(drop=True)], axis=1)
+    codes = dict(s23_codes(s23))
+    parts = [P, S]
+    if s1 is not None:
+        from .profile import profile_arrays, profile_codes, profile_features
+        PA = profile_arrays(s1, s23)
+        codes.update(profile_codes(PA))
+        parts.append(profile_features(s1_idx, r_idx, PA))
+    parts.append(group_features(s1_idx, r_idx, p, codes))
+    return pd.concat(parts + [C.reset_index(drop=True)], axis=1)

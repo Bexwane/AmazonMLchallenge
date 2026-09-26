@@ -298,7 +298,8 @@ def cmd_stack(args):
     """Stage 2 on the stage-1 out-of-fold probabilities (same folds), then choose the selection rule."""
     s1, s23, cand, F, eval_ids = stage_train(args)
     out = Path(args.work) / "experiments" / args.exp
-    O = pd.read_parquet(out / "oof.parquet")
+    out.mkdir(parents=True, exist_ok=True)
+    O = pd.read_parquet(Path(args.work) / "experiments" / (args.p1_from or args.exp) / "oof.parquet")
     assert np.array_equal(O["s1_idx"].to_numpy(), cand["s1_idx"].to_numpy()), "oof rows do not match the features"
     p1, y = O["oof"].to_numpy(np.float32), O["y"].to_numpy().astype(np.int8)
     if "fold" in O:
@@ -309,8 +310,25 @@ def cmd_stack(args):
             folds[va] = k
     truth = read_ground_truth(Path(args.data) / "train" / "train_ground_truth.tsv")
     truth = {k: truth[k] for k in eval_ids}
+    prune = None
+    if args.prune_loss > 0:  # learned blocking: drop pairs stage 1 is sure about, keeping candidate recall
+        n_true = sum(len(truth[k]) for k in eval_ids)
+        rec_block = float(y.sum() / n_true)
+        loss = min(args.prune_loss, 1 - args.min_cand_recall / rec_block)
+        if loss > 0:
+            t_min = float(np.quantile(p1[y == 1], loss))
+            keep = np.flatnonzero(p1 >= t_min)
+            prune = {"p1_min": t_min, "blocking_recall": rec_block, "cand_recall": float(y[keep].sum() / n_true),
+                     "pairs_before": int(len(cand)), "pairs_after": int(len(keep)),
+                     "pairs_per_s1_before": len(cand) / len(eval_ids), "pairs_per_s1_after": len(keep) / len(eval_ids)}
+            cand, F = cand.iloc[keep].reset_index(drop=True), F.iloc[keep].reset_index(drop=True)
+            p1, y, folds = p1[keep], y[keep], folds[keep]
+            gc.collect()
+            log("prune", json.dumps(prune))
+        else:
+            log(f"prune skipped: blocking recall {rec_block:.4f} leaves no room above {args.min_cand_recall}")
     t = time.time()
-    X2 = stack_features(cand, p1, s23, F[args.ctx_cols])
+    X2 = stack_features(cand, p1, s23, F[args.ctx_cols], s1=s1 if args.stack_feat == "v2" else None)
     log(f"stack: features {X2.shape} in {(time.time() - t) / 60:.1f} min")
     del F
     gc.collect()
@@ -339,6 +357,7 @@ def cmd_stack(args):
            "stage2": {"best": {k: v for k, v in rule2.items() if k != "cal"}, "macro_f05": f2, "table": tab2[:10],
                       "best_iters": iters},
            "use_stack": bool(use_stack), "rule": rule, "chosen": breakdown(pred, truth, eval_ids),
+           "stack_feat": args.stack_feat, "prune": prune, "p1_from": args.p1_from,
            "selected_per_s1_oof": float(keep.sum() / len(eval_ids)),
            "stack_feature_gain_top": (imp / imp.sum()).round(4).head(25).to_dict()}
     ec = s1.set_index("entity_id").loc[eval_ids, "country"].to_numpy()
@@ -415,9 +434,12 @@ def cmd_predict(args):
     """Test prediction, memory-lean: the 1e8-row candidate table is kept as separate numpy columns and
     feature matrices are only built 4M rows at a time."""
     out = Path(args.work) / "experiments" / args.exp
-    models = _load_models(out, "model") or [lgb.Booster(model_file=str(out / "model.txt"))]
-    names = models[0].feature_name()
-    log(f"stage 1: {len(models)} model(s), {len(names)} features")
+    if args.p1_from:  # E011: reuse another experiment's stage-1 test probabilities
+        models, names = [], []
+    else:
+        models = _load_models(out, "model") or [lgb.Booster(model_file=str(out / "model.txt"))]
+        names = models[0].feature_name()
+        log(f"stage 1: {len(models)} model(s), {len(names)} features")
     pc = Path(args.work) / "test" / f"cand_{args.block_tag}.parquet"
     if not pc.exists():  # blocking in this process; prefer `ber.run block --split test` beforehand
         stage_candidates(args, "test")
@@ -446,7 +468,14 @@ def cmd_predict(args):
         C["conj_cos"] = pair_conj_cos(cand, s1, s23, log=log)
     p1 = np.empty(len(cand), np.float32)
     step = 4_000_000  # features are built per chunk; the full test matrix never exists
-    for a in range(0, len(cand), step):
+    if args.p1_from:
+        T = pd.read_parquet(Path(args.work) / "experiments" / args.p1_from / "test_pairs_proba.parquet",
+                            columns=["s1_idx", "r_idx", "p1"])
+        assert np.array_equal(T["s1_idx"].to_numpy(), cand["s1_idx"].to_numpy()) and             np.array_equal(T["r_idx"].to_numpy(), cand["r_idx"].to_numpy()), "stage-1 probabilities do not match the candidates"
+        p1[:] = T["p1"].to_numpy(np.float32)
+        del T
+        log(f"stage 1: reused p1 from {args.p1_from}")
+    for a in range(0, len(cand), step) if not args.p1_from else ():
         sub = cand.iloc[a:a + step]
         parts = [string_features(sub, s1, s23)]
         if "a_num_tset" in names:
@@ -460,15 +489,23 @@ def cmd_predict(args):
         p1[a:a + step] = np.mean([m.predict(Fc) for m in models], axis=0)
         del Fc, parts
         log(f"stage 1: predicted {min(a + step, len(cand))}/{len(cand)}")
-    p = p1
     sm = json.loads((out / "stack_metrics.json").read_text()) if (out / "stack_metrics.json").exists() else None
+    if sm and sm.get("prune") and sm["prune"].get("p1_min") is not None:  # learned blocking (stage 1 as filter)
+        keep = np.flatnonzero(p1 >= sm["prune"]["p1_min"])
+        n0 = len(cand)
+        cand, p1 = cand.iloc[keep].reset_index(drop=True), p1[keep]
+        C = {k: np.asarray(C[k][keep]) for k in ctx_cols}
+        gc.collect()
+        log(f"prune: p1 >= {sm['prune']['p1_min']:.2e} keeps {len(cand)}/{n0} pairs ({len(cand) / len(s1):.1f}/S1)")
+    p = p1
     stack = _load_models(out, "stack") if sm and sm["use_stack"] else []
     if stack:
         names2 = stack[0].feature_name()
+        prof = s1 if sm.get("stack_feat") == "v2" else None
         p = np.empty(len(cand), np.float32)
         for rows in _s1_chunks(cand["s1_idx"].to_numpy()):
             Cc = pd.DataFrame({k: C[k][rows] for k in ctx_cols})
-            X2 = stack_features(cand.iloc[rows], p1[rows], s23, Cc)[names2]
+            X2 = stack_features(cand.iloc[rows], p1[rows], s23, Cc, s1=prof)[names2]
             p[rows] = np.mean([m.predict(X2) for m in stack], axis=0)
             log(f"stage 2: {len(rows)} pairs")
     del C
@@ -568,6 +605,11 @@ def main():
     ap.add_argument("--no-stress", dest="stress", action="store_false", help="skip the country-holdout stress models")
     ap.add_argument("--count-match", default="none", choices=["none", "unseen", "all"],
                     help="shift each test country's logits to the out-of-fold matches-per-S1 (unseen = new countries only)")
+    ap.add_argument("--p1-from", default="", help="stack/predict: reuse this experiment's stage-1 OOF and test p1")
+    ap.add_argument("--stack-feat", default="v1", choices=["v1", "v2"], help="v2 adds legal-form/word/house-number profiles")
+    ap.add_argument("--prune-loss", type=float, default=0.0,
+                    help="stack: drop pairs below the p1 quantile losing this share of true candidate pairs")
+    ap.add_argument("--min-cand-recall", type=float, default=0.98, help="pruning never takes candidate recall below this")
     ap.add_argument("--cand-from", default="", help="select: symlink candidate_pairs.tsv from this output dir")
     args = ap.parse_args()
     PARAMS["learning_rate"] = args.lr
