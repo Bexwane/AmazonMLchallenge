@@ -686,7 +686,26 @@ def cmd_select(args):
     out = Path(args.work) / "experiments" / args.exp
     s1, s23 = load_prepared(args.data, "test", args.work)
     T = pd.read_parquet(out / "test_pairs_proba.parquet")
-    write_selection(args, out, T[["s1_idx", "r_idx"]], T["p"].to_numpy(np.float32), s1, s23)
+    p = T["p"].to_numpy(np.float32)
+    if args.blend_from:  # average with another run's test probabilities (pairs it did not score keep this run's p)
+        bf = Path(args.blend_from)
+        chk = bf.with_name(bf.stem + "_ids.json")
+        if chk.exists():  # both runs must index the same prepared test tables
+            ids = json.loads(chk.read_text())
+            assert ids["n_s1"] == len(s1) and ids["n_s23"] == len(s23), "blend file: different test tables"
+            for i, e in ids["s1"]:
+                assert s1["entity_id"].iat[i] == e, "blend file: S1 row order differs"
+            for i, e in ids["s23"]:
+                assert s23["entity_id"].iat[i] == e, "blend file: S2/S3 row order differs"
+        B = pd.read_parquet(bf, columns=["s1_idx", "r_idx", "p"])
+        key = lambda a, b: a.astype(np.int64) * (len(s23) + 1) + b.astype(np.int64)
+        pb = pd.Series(B["p"].to_numpy(np.float32), index=key(B["s1_idx"].to_numpy(), B["r_idx"].to_numpy()))
+        pb = pb.reindex(key(T["s1_idx"].to_numpy(), T["r_idx"].to_numpy())).to_numpy(np.float32)
+        have = ~np.isnan(pb)
+        p = np.where(have, args.blend_weight * p + (1 - args.blend_weight) * pb, p).astype(np.float32)
+        log(f"blend: {have.mean():.3f} of {len(p)} pairs also scored in {bf.name} ({len(B)} pairs); weight {args.blend_weight}")
+        del B, pb
+    write_selection(args, out, T[["s1_idx", "r_idx"]], p, s1, s23)
 
 
 def block_tag(args):
@@ -722,6 +741,9 @@ def main():
     ap.add_argument("--dense-model", default="none", choices=["none", "e5s", "e5b", "bge"],
                     help="dense encoder for --feat v5 (none = v5 without dense cosines)")
     ap.add_argument("--no-stress", dest="stress", action="store_false", help="skip the country-holdout stress models")
+    ap.add_argument("--blend-from", default="", help="select: parquet (s1_idx, r_idx, p) of another run's test "
+                                                     "probabilities to average with this run's")
+    ap.add_argument("--blend-weight", type=float, default=0.5, help="weight of this run's p in the blend")
     ap.add_argument("--count-scale", default="", help="per-country factor on the count-matching target, e.g. "
                                                         "France=0.97 (label-free probes for the unseen country)")
     ap.add_argument("--count-match", default="none", choices=["none", "unseen", "all"],
