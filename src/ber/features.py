@@ -194,3 +194,26 @@ def pair_features(cand: pd.DataFrame, s1: pd.DataFrame, s23: pd.DataFrame, rows=
     C = context_features(cand, rows)
     sub = cand if rows is None else cand[rows]
     return pd.concat([string_features(sub, s1, s23, workers), C], axis=1)
+
+
+def name_amb_arrays(s1: pd.DataFrame, s23: pd.DataFrame):
+    """Global name ambiguity (E010). A S2/S3 record without address whose name is carried by several
+    Source-1 entities cannot be attributed from the pair alone; the pair model must see how ambiguous the
+    name is, including rival S1s that never reached the record's candidate list."""
+    n1, n23 = s1["name_core"].to_numpy(object), s23["name_core"].to_numpy(object)
+    codes, uniq = pd.factorize(np.concatenate([n1, n23]))
+    empty = np.flatnonzero(uniq == "")
+    if len(empty):
+        codes[codes == empty[0]] = -1
+    c1, c23 = codes[:len(n1)], codes[len(n1):]
+    cnt1 = np.bincount(c1[c1 >= 0], minlength=len(uniq)).astype(np.float32)
+    cnt23 = np.bincount(c23[c23 >= 0], minlength=len(uniq)).astype(np.float32)
+    at = lambda cnt, c: np.where(c >= 0, cnt[np.maximum(c, 0)], 0).astype(np.float32)
+    return {"l_name_s1dup": at(cnt1, c1), "r_name_s1cnt": at(cnt1, c23), "r_name_s23cnt": at(cnt23, c23)}
+
+
+def name_amb_features(s1_idx, r_idx, A) -> pd.DataFrame:
+    """l_name_s1dup: S1 entities sharing this S1's core name; r_name_s1cnt: S1 entities carrying the
+    record's core name; r_name_s23cnt: S2/S3 records with that name (a twin entity adds its own)."""
+    return pd.DataFrame({"l_name_s1dup": A["l_name_s1dup"][s1_idx], "r_name_s1cnt": A["r_name_s1cnt"][r_idx],
+                         "r_name_s23cnt": A["r_name_s23cnt"][r_idx]})

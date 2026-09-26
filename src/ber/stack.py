@@ -7,7 +7,14 @@
    to Source-1 is weak (native-script names, rewritten addresses). For every pair we compare its S2/S3
    record with the top-`top` other candidates (p >= min_p) of the same Source-1 entity.
 
-Both only use pairs of the same Source-1 entity, so they are identical whether the entity is in a
+3. Group consensus (E010): the entity's candidates are grouped by exact normalized address, core name and
+   house number. Synthetic "twin" businesses copy a real one with a nudged house number (2921 -> 2942) and
+   often one extra name word, and every record of the twin carries the same change, so the twin forms its
+   own group; a true record whose number has a typo is a lone outlier inside the true entity's group mass.
+   Per pair: its group's size, probability mass (without the pair), share of the entity's mass, and gap to
+   the entity's heaviest group.
+
+All only use pairs of the same Source-1 entity, so they are identical whether the entity is in a
 sampled training subset or in the full test set (no dependence on other entities' predictions).
 """
 import numpy as np
@@ -100,9 +107,52 @@ def sibling_features(s1_idx: np.ndarray, r_idx: np.ndarray, p: np.ndarray, s23: 
     return pd.DataFrame(feats)
 
 
+_CODES = {}
+
+
+def s23_codes(s23: pd.DataFrame) -> dict:
+    """Integer codes of the S2/S3 exact normalized address, core name and first house number (-1 = empty),
+    memoized per frame (predict calls stack_features once per chunk)."""
+    key = id(s23)
+    if key not in _CODES:
+        out = {}
+        hnum = s23["addr_nums"].astype(str).str.split(" ", n=1).str[0]
+        for k, col in (("addr", s23["addr_clean"].astype(str)), ("name", s23["name_core"].astype(str)), ("hnum", hnum)):
+            c, u = pd.factorize(col.to_numpy(object))
+            e = np.flatnonzero(u == "")
+            if len(e):
+                c[c == e[0]] = -1
+            out[k] = c.astype(np.int64)
+        _CODES.clear()
+        _CODES[key] = out
+    return _CODES[key]
+
+
+def group_features(s1_idx: np.ndarray, r_idx: np.ndarray, p: np.ndarray, codes: dict) -> pd.DataFrame:
+    n = len(p)
+    p = p.astype(np.float64)
+    tot = np.bincount(s1_idx, weights=p)[s1_idx]
+    F = {}
+    for k, c23 in codes.items():
+        c = c23[r_idx]
+        key = s1_idx.astype(np.int64) * (int(c23.max()) + 2) + c + 1
+        key = np.where(c >= 0, key, -1 - np.arange(n, dtype=np.int64))  # empty code: a group of its own
+        gid, _ = pd.factorize(key)
+        psum = np.bincount(gid, weights=p)
+        size = np.bincount(gid).astype(np.float32)
+        best = np.zeros(int(s1_idx.max()) + 1)
+        np.maximum.at(best, s1_idx, psum[gid])
+        F[f"grp_{k}_n"] = size[gid]
+        F[f"grp_{k}_psum_oth"] = (psum[gid] - p).astype(np.float32)
+        F[f"grp_{k}_share"] = (psum[gid] / np.maximum(tot, 1e-6)).astype(np.float32)
+        F[f"grp_{k}_gap"] = (best[s1_idx] - psum[gid]).astype(np.float32)
+    return pd.DataFrame(F)
+
+
 def stack_features(cand: pd.DataFrame, p: np.ndarray, s23: pd.DataFrame, C: pd.DataFrame) -> pd.DataFrame:
     """Stage-2 matrix: probability context + sibling agreement + the (candidate-table) context features."""
     s1_idx, r_idx = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
     P = p_context(s1_idx, p)
     S = sibling_features(s1_idx, r_idx, p, s23)
-    return pd.concat([P, S, C.reset_index(drop=True)], axis=1)
+    G = group_features(s1_idx, r_idx, p, s23_codes(s23))
+    return pd.concat([P, S, G, C.reset_index(drop=True)], axis=1)

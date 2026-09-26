@@ -30,7 +30,8 @@ from .channels import pair_conj_cos, retrieve
 from .config import SEED
 from .dense import DENSE_INFO, dense_context_arrays, load_encoder, pair_dense_cos
 from .features import (context2_arrays, context_arrays, context_columns, context_features, crowd_arrays,
-                       crowd_features, extra_features, pair_features, string_features)
+                       crowd_features, extra_features, name_amb_arrays, name_amb_features, pair_features,
+                       string_features)
 from .io import read_ground_truth, write_grouped
 from .labels import blocking_report, label_pairs
 from .metric import breakdown
@@ -98,7 +99,16 @@ def stage_train(args):
             X4 = pd.concat([X4, crowd_features(si[rows], ri[rows], crowd_arrays(s1, s23))], axis=1)
             X4.to_parquet(p4, index=False)
             log(f"train: v4 features built in {(time.time() - t) / 60:.1f} min")
-    if args.feat == "v5":  # dense multilingual cosines + their competition (see dense.py)
+    if args.feat == "v5":  # global name ambiguity (+ dense multilingual cosines unless --dense-model none)
+        pa = Path(args.work) / "train" / f"featx5a_{args.block_tag}_f{args.cv_frac:g}.parquet"
+        if pa.exists():
+            XA = pd.read_parquet(pa)
+        else:
+            si, ri = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
+            XA = name_amb_features(si[rows], ri[rows], name_amb_arrays(s1, s23)).reset_index(drop=True)
+            XA.to_parquet(pa, index=False)
+        X4 = pd.concat([X4, XA], axis=1)
+    if args.feat == "v5" and args.dense_model != "none":
         p5 = Path(args.work) / "train" / f"featx5_{args.dense_model}_{args.block_tag}_f{args.cv_frac:g}.parquet"
         if p5.exists():
             X5 = pd.read_parquet(p5)
@@ -425,6 +435,7 @@ def cmd_predict(args):
         C.update(context2_arrays(cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy(), C["name_cos"], C["addr_cos"]))
         A = crowd_arrays(s1, s23)
         gc.collect()
+    AN = name_amb_arrays(s1, s23) if "r_name_s1cnt" in names else None
     if "d_full" in names:  # v5 dense cosines (cached by `ber.run dense --split test`)
         si_, ri_ = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
         D = dense_arrays(args, "test", s1, s23, si_, ri_)
@@ -443,6 +454,8 @@ def cmd_predict(args):
         parts.append(pd.DataFrame({k: np.asarray(v[a:a + step], np.float32) for k, v in C.items()}, index=sub.index))
         if A is not None:
             parts.append(crowd_features(sub["s1_idx"].to_numpy(), sub["r_idx"].to_numpy(), A).set_axis(sub.index))
+        if AN is not None:
+            parts.append(name_amb_features(sub["s1_idx"].to_numpy(), sub["r_idx"].to_numpy(), AN).set_axis(sub.index))
         Fc = pd.concat(parts, axis=1)[names]
         p1[a:a + step] = np.mean([m.predict(Fc) for m in models], axis=0)
         del Fc, parts
@@ -540,15 +553,16 @@ def main():
     ap.add_argument("--lr", type=float, default=0.1, help="LightGBM learning rate (0.05 in E001-E003)")
     ap.add_argument("--feat", default="v2", choices=["v2", "v3", "v4", "v5"],
                     help="v3 adds house-number and conj_cos features; v4 adds name/address competition and shared-address "
-                         "counts; v5 adds dense multilingual cosines (needs a GPU once per split, then cached)")
-    ap.add_argument("--dense-model", default="e5s", choices=["e5s", "e5b", "bge"], help="encoder for --feat v5")
+                         "counts; v5 adds global name ambiguity and, with --dense-model, dense multilingual cosines")
+    ap.add_argument("--dense-model", default="none", choices=["none", "e5s", "e5b", "bge"],
+                    help="dense encoder for --feat v5 (none = v5 without dense cosines)")
     ap.add_argument("--no-stress", dest="stress", action="store_false", help="skip the country-holdout stress models")
     ap.add_argument("--count-match", default="none", choices=["none", "unseen", "all"],
                     help="shift each test country's logits to the out-of-fold matches-per-S1 (unseen = new countries only)")
     args = ap.parse_args()
     PARAMS["learning_rate"] = args.lr
     args.block_tag = block_tag(args)
-    if os.environ.get("BER_DENSE_FAKE"):  # smoke tests: never mix stand-in cosines with real model caches
+    if os.environ.get("BER_DENSE_FAKE") and args.dense_model != "none":  # smoke tests: never mix stand-in cosines with real model caches
         args.dense_model = "fake"
     {"cv": cmd_cv, "fit": cmd_fit, "predict": cmd_predict, "block": cmd_block, "holdout": cmd_holdout,
      "stack": cmd_stack, "select": cmd_select, "dense": cmd_dense}[args.cmd](args)
