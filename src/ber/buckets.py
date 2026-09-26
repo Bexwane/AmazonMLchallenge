@@ -179,3 +179,23 @@ def write_report(path, summary: dict, miss: pd.DataFrame, hit: pd.DataFrame):
         out += [f"### {mode}", "", _md(miss.loc[miss["mode"] == mode, cols].head(5)), ""]
     open(path, "w", encoding="utf-8").write("\n".join(out))
     return top
+
+
+def eval_slices(s1: pd.DataFrame, s23: pd.DataFrame, truth: dict, ids) -> dict:
+    """Diagnostic slices of evaluation Source-1 ids (macro F0.5 per slice locates the loss):
+    true-match script (any native-script true record vs Latin only), singletons, true-cluster size, and
+    whether the S1 shares its exact normalized address with another S1 (the France over-merge pattern)."""
+    ids = np.asarray(ids, object)
+    t = [truth.get(s, ()) for s in ids]
+    size = np.array([len(x) for x in t])
+    flat = [r for x in t for r in x]
+    owner = np.repeat(np.arange(len(ids)), size)
+    nat = pd.Series(s23["name_native"].to_numpy(bool), index=s23["entity_id"].to_numpy(object))
+    v = nat.reindex(flat).fillna(False).to_numpy(np.float64)
+    any_native = np.bincount(owner, weights=v, minlength=len(ids)) > 0
+    addr = s1.set_index("entity_id")["addr_clean"].astype(str)
+    cnt = addr.map(addr.value_counts())
+    shared = ((cnt.reindex(ids).to_numpy() >= 2) & (addr.reindex(ids).to_numpy() != ""))
+    return {"singleton": ids[size == 0], "true_native": ids[any_native], "true_latin_only": ids[(size > 0) & ~any_native],
+            "true_size_1": ids[size == 1], "true_size_2_4": ids[(size >= 2) & (size <= 4)], "true_size_5p": ids[size >= 5],
+            "s1_addr_shared": ids[shared], "s1_addr_unique": ids[~shared]}

@@ -7,6 +7,7 @@
   python -m ber.run holdout --data DIR --work DIR --exp ID                # one cheap validation split
   python -m ber.run stack   --data DIR --work DIR --exp ID                # stage 2 on the cv out-of-fold p
   python -m ber.run select  --data DIR --work DIR --exp ID --out DIR [--count-match unseen]  # re-select saved p
+  python -m ber.run dense   --data DIR --work DIR --exp ID --split test --dense-model e5s   # dense cosines (GPU, cache)
 
 DIR is the official `dataset/` folder (holding train/ and test/) or a subset built by
 scripts/make_subset.py. Every expensive stage is cached under WORK/<split>/.
@@ -14,6 +15,7 @@ scripts/make_subset.py. Every expensive stage is cached under WORK/<split>/.
 import argparse
 import gc
 import json
+import os
 import time
 from pathlib import Path
 
@@ -23,9 +25,10 @@ import pandas as pd
 from sklearn.model_selection import GroupKFold
 
 from .blocking import generate_candidates
-from .buckets import assign_modes, name_frequency, pair_table
+from .buckets import assign_modes, eval_slices, name_frequency, pair_table
 from .channels import pair_conj_cos, retrieve
 from .config import SEED
+from .dense import DENSE_INFO, dense_context_arrays, load_encoder, pair_dense_cos
 from .features import (context2_arrays, context_arrays, context_columns, context_features, crowd_arrays,
                        crowd_features, extra_features, pair_features, string_features)
 from .io import read_ground_truth, write_grouped
@@ -82,7 +85,7 @@ def stage_train(args):
         log(f"train: features built in {(time.time() - t) / 60:.1f} min")
     args.ctx_cols = context_columns(cand)
     X4 = None
-    if args.feat == "v4":  # name/address competition + shared-address counts (see features.context2_arrays)
+    if args.feat in ("v4", "v5"):  # name/address competition + shared-address counts (see features.context2_arrays)
         p4 = Path(args.work) / "train" / f"featx4_{args.block_tag}_f{args.cv_frac:g}.parquet"
         if p4.exists():
             X4 = pd.read_parquet(p4)
@@ -95,9 +98,20 @@ def stage_train(args):
             X4 = pd.concat([X4, crowd_features(si[rows], ri[rows], crowd_arrays(s1, s23))], axis=1)
             X4.to_parquet(p4, index=False)
             log(f"train: v4 features built in {(time.time() - t) / 60:.1f} min")
+    if args.feat == "v5":  # dense multilingual cosines + their competition (see dense.py)
+        p5 = Path(args.work) / "train" / f"featx5_{args.dense_model}_{args.block_tag}_f{args.cv_frac:g}.parquet"
+        if p5.exists():
+            X5 = pd.read_parquet(p5)
+        else:
+            si, ri = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
+            D = dense_arrays(args, "train", s1, s23, si, ri)
+            X5 = pd.DataFrame({k: v.astype(np.float32) for k, v in dense_context_arrays(si, ri, D, rows).items()})
+            del D
+            X5.to_parquet(p5, index=False)
+        X4 = pd.concat([X4, X5], axis=1)
     cand = cand.loc[rows, ["s1_idx", "r_idx", "name_cos", "addr_cos"]].reset_index(drop=True)
     gc.collect()
-    if args.feat in ("v3", "v4"):  # extra pair features, cached separately so the v2 matrix is reused
+    if args.feat in ("v3", "v4", "v5"):  # extra pair features, cached separately so the v2 matrix is reused
         px = Path(args.work) / "train" / f"featx3_{args.block_tag}_f{args.cv_frac:g}.parquet"
         if px.exists():
             X = pd.read_parquet(px)
@@ -112,6 +126,37 @@ def stage_train(args):
         F = pd.concat([F, X4], axis=1)
     log(f"train: features {F.shape} for {int(s1_keep.sum())} sampled S1")
     return s1, s23, cand, F, s1["entity_id"].to_numpy()[s1_keep]
+
+
+def dense_arrays(args, split, s1, s23, si, ri):
+    """Per-pair dense cosines for the full candidate table of a split, cached as float16 .npy."""
+    d = Path(args.work) / split
+    paths = {f: d / f"dense_{args.dense_model}_{f}_{args.block_tag}.npy" for f in ("name", "full")}
+    if all(p.exists() for p in paths.values()):
+        D = {f: np.load(p) for f, p in paths.items()}
+        assert all(len(v) == len(si) for v in D.values()), "dense cache does not match the candidate table"
+        return D
+    t = time.time()
+    enc = load_encoder(args.dense_model)
+    D = pair_dense_cos(s1, s23, si, ri, enc, prefix=getattr(enc, "prefix", ""), log=log)
+    del enc
+    gc.collect()
+    for f, p in paths.items():
+        np.save(p, D[f])
+    DENSE_INFO.update({"split": split, "pairs": int(len(si)), "minutes": round((time.time() - t) / 60, 1)})
+    (d / f"dense_{args.dense_model}_info.json").write_text(json.dumps(DENSE_INFO, indent=1))
+    log(f"{split}: dense cosines for {len(si)} pairs in {(time.time() - t) / 60:.1f} min: {json.dumps(DENSE_INFO)}")
+    return D
+
+
+def cmd_dense(args):
+    """Dense cosines for a split's cached candidates (GPU), so cv/stack/predict find them cached."""
+    s1, s23 = load_prepared(args.data, args.split, args.work)
+    pc = Path(args.work) / args.split / f"cand_{args.block_tag}.parquet"
+    if not pc.exists():
+        stage_candidates(args, args.split)
+    cols = _read_columns(pc)
+    dense_arrays(args, args.split, s1, s23, cols["s1_idx"], cols["r_idx"])
 
 
 def train_lgb(X, y, Xv=None, yv=None, rounds=1500):
@@ -156,6 +201,8 @@ def cmd_cv(args):
     ec = s1.set_index("entity_id").loc[all_ids, "country"].to_numpy()
     for c in sorted(set(ec)):
         res[f"cv_{c}"] = breakdown(pred, truth, all_ids[ec == c])
+    for b, ids_b in eval_slices(s1, s23, truth, all_ids).items():  # script / crowd / cluster-size diagnostics
+        res[f"slice_{b}"] = breakdown(pred, truth, ids_b)
     # stress: hold out one whole country (proxy for the unseen test country)
     cc = s1c[groups]
     rule_nc = {k: v for k, v in rule.items() if k != "cal"}
@@ -287,6 +334,8 @@ def cmd_stack(args):
     ec = s1.set_index("entity_id").loc[eval_ids, "country"].to_numpy()
     for c in sorted(set(ec)):
         res[f"chosen_{c}"] = breakdown(pred, truth, eval_ids[ec == c])
+    for b, ids_b in eval_slices(s1, s23, truth, eval_ids).items():
+        res[f"slice_{b}"] = breakdown(pred, truth, ids_b)
     (out / "stack_metrics.json").write_text(json.dumps(res, indent=1))
     # error sample for offline analysis: false negatives, false positives, true positives
     rng = np.random.default_rng(SEED)
@@ -375,6 +424,12 @@ def cmd_predict(args):
     if "name_rank_r" in names:  # v4 (float16 until each chunk is cast, as in training)
         C.update(context2_arrays(cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy(), C["name_cos"], C["addr_cos"]))
         A = crowd_arrays(s1, s23)
+        gc.collect()
+    if "d_full" in names:  # v5 dense cosines (cached by `ber.run dense --split test`)
+        si_, ri_ = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
+        D = dense_arrays(args, "test", s1, s23, si_, ri_)
+        C.update(dense_context_arrays(si_, ri_, D))
+        del D, si_, ri_
         gc.collect()
     if "conj_cos" in names:
         C["conj_cos"] = pair_conj_cos(cand, s1, s23, log=log)
@@ -466,8 +521,8 @@ def block_tag(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["cv", "fit", "predict", "block", "holdout", "stack", "select"])
-    ap.add_argument("--split", default="train", choices=["train", "test"], help="for `block`")
+    ap.add_argument("cmd", choices=["cv", "fit", "predict", "block", "holdout", "stack", "select", "dense"])
+    ap.add_argument("--split", default="train", choices=["train", "test"], help="for `block` and `dense`")
     ap.add_argument("--data", required=True)
     ap.add_argument("--work", required=True)
     ap.add_argument("--exp", required=True)
@@ -483,16 +538,20 @@ def main():
     ap.add_argument("--rrf-m", type=int, default=0, help="optional cap per S1 after RRF (0 = keep the whole union; "
                                                          "rescue pairs are always kept)")
     ap.add_argument("--lr", type=float, default=0.1, help="LightGBM learning rate (0.05 in E001-E003)")
-    ap.add_argument("--feat", default="v2", choices=["v2", "v3", "v4"],
-                    help="v3 adds house-number and conj_cos features; v4 adds name/address competition and shared-address counts")
+    ap.add_argument("--feat", default="v2", choices=["v2", "v3", "v4", "v5"],
+                    help="v3 adds house-number and conj_cos features; v4 adds name/address competition and shared-address "
+                         "counts; v5 adds dense multilingual cosines (needs a GPU once per split, then cached)")
+    ap.add_argument("--dense-model", default="e5s", choices=["e5s", "e5b", "bge"], help="encoder for --feat v5")
     ap.add_argument("--no-stress", dest="stress", action="store_false", help="skip the country-holdout stress models")
     ap.add_argument("--count-match", default="none", choices=["none", "unseen", "all"],
                     help="shift each test country's logits to the out-of-fold matches-per-S1 (unseen = new countries only)")
     args = ap.parse_args()
     PARAMS["learning_rate"] = args.lr
     args.block_tag = block_tag(args)
+    if os.environ.get("BER_DENSE_FAKE"):  # smoke tests: never mix stand-in cosines with real model caches
+        args.dense_model = "fake"
     {"cv": cmd_cv, "fit": cmd_fit, "predict": cmd_predict, "block": cmd_block, "holdout": cmd_holdout,
-     "stack": cmd_stack, "select": cmd_select}[args.cmd](args)
+     "stack": cmd_stack, "select": cmd_select, "dense": cmd_dense}[args.cmd](args)
 
 
 if __name__ == "__main__":
