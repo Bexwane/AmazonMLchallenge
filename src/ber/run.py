@@ -509,7 +509,16 @@ def write_selection(args, out, cand, p, s1, s23):
     si, ri = cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy()
     od = Path(args.out)
     write_grouped(od / "matching_results.tsv", s1_ids, si[keep], ri[keep], r_ids, "matched_entity_ids")
-    write_grouped(od / "candidate_pairs.tsv", s1_ids, si, ri, r_ids, "candidate_entity_ids")
+    linked = False
+    if args.cand_from:  # identical for every selection variant: link instead of another ~1.3 GB copy
+        (od / "candidate_pairs.tsv").unlink(missing_ok=True)
+        try:
+            (od / "candidate_pairs.tsv").symlink_to(Path(args.cand_from).resolve() / "candidate_pairs.tsv")
+            linked = True
+        except OSError:  # no symlink privilege (Windows): write the file
+            pass
+    if not linked:
+        write_grouped(od / "candidate_pairs.tsv", s1_ids, si, ri, r_ids, "candidate_entity_ids")
     n = np.bincount(si[keep], minlength=len(s1_ids))  # matches per S1 (exclusivity makes pairs unique)
     info["per_country"] = {c: {"mean_matches": float(n[s1c == c].mean()), "empty_rate": float((n[s1c == c] == 0).mean()),
                                "n_s1": int((s1c == c).sum())} for c in sorted(set(s1c))}
@@ -559,6 +568,7 @@ def main():
     ap.add_argument("--no-stress", dest="stress", action="store_false", help="skip the country-holdout stress models")
     ap.add_argument("--count-match", default="none", choices=["none", "unseen", "all"],
                     help="shift each test country's logits to the out-of-fold matches-per-S1 (unseen = new countries only)")
+    ap.add_argument("--cand-from", default="", help="select: symlink candidate_pairs.tsv from this output dir")
     args = ap.parse_args()
     PARAMS["learning_rate"] = args.lr
     args.block_tag = block_tag(args)
