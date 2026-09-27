@@ -13,7 +13,7 @@ without address) reach 98.2% pair recall. Pair features cover string similarity,
 cosines and, as our key innovation, **identity profiles** (legal form, business words, house number) and
 **competition features** that separate the dataset's synthetic "twin" businesses from true noisy records. Selection
 maximizes per-entity expected F0.5 with one S1 per record and per-country count matching for the unseen
-country. Public LB 0.971171; out-of-fold CV macro F0.5 0.9797 (India 0.9735, US 0.9838).
+country. Public LB 0.971723; out-of-fold CV macro F0.5 0.9801 (bagged stage 1).
 
 ---
 
@@ -86,8 +86,10 @@ profile and pair features above. Trained on the stage-1 out-of-fold predictions 
 learned-blocking candidates. A decoy-weighted variant (negatives from records owned by no S1 ×1.9, matching test's
 decoy density) is trained too; the variant and the rule are chosen on a test-like out-of-fold set.
 
-**Model type:** LightGBM (binary, 127 leaves, lr 0.1, early stopping), 3-fold GroupKFold by S1 on a 10% S1 sample
-(14.5M pairs); stage 2 idem on the pruned pairs (0.98M). Test = average of the 3 fold models per stage.  
+**Model type:** LightGBM (binary, lr 0.1, early stopping), 3-fold GroupKFold by S1 on a 10% S1 sample (14.5M pairs).
+Stage 1 is **bagged**: two LightGBM variants on the same features (127 leaves / seed 42 and 255 leaves, feature fraction
+0.7 / seed 2027); their out-of-fold probabilities are averaged for stage 2, and all 6 fold models are averaged on test.
+Stage 2 idem on the pruned pairs. Test = average of the fold models per stage.  
 **Threshold selection method:** out-of-fold study of a global threshold vs per-S1 expected-F0.5 selection (with
 an explicit "predict nothing" option); chosen: threshold 0.725 on stage-2 probabilities, after one-S1-per-record
 exclusivity. For the test set, logits are shifted per country (bisection) so every country selects the
@@ -98,8 +100,8 @@ best: ×0.98 and ×1.02 for US scored lower).
 
 ## 5. Results & Error Analysis
 
-- **F_0.5 Score (macro):** 0.9797 out of fold on 220,140 train S1 (precision 0.9950, recall 0.9551;
-  singletons 0.9840); public leaderboard **0.971171**.
+- **F_0.5 Score (macro):** 0.9801 out of fold on 220,140 train S1 (bagged stage 1; single stage 1: 0.9797,
+  precision 0.9950, recall 0.9551, singletons 0.9840); public leaderboard **0.971723**.
 - **Common false positives (wrong merges):** synthetic twins at the same street with a nudged house number and a
   changed legal form or extra business word (sharply reduced by the profile features); records of a different S1
   sharing an exact name (common names such as "Downtown Hair Studio"); French generic names ("Lille Club SARL")
@@ -113,12 +115,13 @@ best: ×0.98 and ×1.02 for US scored lower).
 | E009 | v4 features, stage-2 stacking, expected-F selection, count matching | 0.9647 | 0.950 |
 | E011v3 | stage 2: identity profiles, group consensus, name ambiguity, pair similarities | 0.9780 | 0.965 |
 | E013 | test-like decoy weighting, France ×0.97 | 0.9779 | 0.96592 |
-| **E012-full** | rebuilt stage 1 with profiles + dense e5 cosines, stage 2 v3 | **0.9797** | **0.971171** |
+| E012-full | rebuilt stage 1 with profiles + dense e5 cosines, stage 2 v3 | 0.9797 | 0.971171 |
+| **E015** | E012 + bagged stage 1 (second LightGBM variant, averaged) | **0.9801** | **0.971723** |
 
 ---
 
 ## 6. Conclusion
-Recall-first multi-channel blocking plus a stacked LightGBM matcher reaches 0.9797 CV / 0.971 LB. The largest gains came
+Recall-first multi-channel blocking plus a stacked LightGBM matcher reaches 0.9801 CV / 0.9717 LB. The largest gains came
 from understanding how the data was generated: twin businesses differ from true records in legal form,
 business words and house-number digits, and each record belongs to exactly one S1, so record-side competition
 (dense-cosine rank among the record's candidate S1s) is the strongest signal. Lessons: validate on a test-like

@@ -1,8 +1,8 @@
 # Business Entity Resolution: reproduction guide
 
 Pipeline: **normalize → multi-channel blocking → dense cosines → stage-1 LightGBM → stage-2 LightGBM
-(learned blocking) → exclusive, count-matched selection**. Final submission = experiment **E012-full**
-(public LB 0.971171; out-of-fold CV macro F0.5 0.9797 on India + US).
+(learned blocking) → exclusive, count-matched selection**. Final submission = experiment **E015**
+(E012-full + bagged stage 1; public LB 0.971723; out-of-fold CV macro F0.5 0.9801 on India + US).
 
 ## Environment
 - Python 3.11/3.12, `pip install -r requirements.txt`
