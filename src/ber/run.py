@@ -577,6 +577,10 @@ def cmd_predict(args):
     del cols
     gc.collect()
     ctx_cols = list(C)
+    conj = None
+    if "conj_cos" in names:  # first: its per-country sparse matrices must not stack on the arrays below (OOM)
+        conj = pair_conj_cos(cand, s1, s23, log=log)
+        gc.collect()
     A = None
     if "name_rank_r" in names:  # v4 (float16 until each chunk is cast, as in training)
         C.update(context2_arrays(cand["s1_idx"].to_numpy(), cand["r_idx"].to_numpy(), C["name_cos"], C["addr_cos"]))
@@ -590,10 +594,11 @@ def cmd_predict(args):
         C.update(dense_context_arrays(si_, ri_, D))
         del D, si_, ri_
         gc.collect()
-    if "conj_cos" in names:
-        C["conj_cos"] = pair_conj_cos(cand, s1, s23, log=log)
+    if conj is not None:
+        C["conj_cos"] = conj
+        del conj
     p1 = np.empty(len(cand), np.float32)
-    step = 4_000_000  # features are built per chunk; the full test matrix never exists
+    step = 2_000_000  # features are built per chunk; the full test matrix never exists
     if args.p1_from:
         T = pd.read_parquet(Path(args.work) / "experiments" / args.p1_from / "test_pairs_proba.parquet",
                             columns=["s1_idx", "r_idx", "p1"])
