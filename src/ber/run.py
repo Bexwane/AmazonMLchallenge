@@ -326,7 +326,19 @@ def cmd_stack(args):
     """Stage 2 on the stage-1 out-of-fold probabilities (same folds), then choose the selection rule."""
     out = Path(args.work) / "experiments" / args.exp
     out.mkdir(parents=True, exist_ok=True)
-    O = pd.read_parquet(Path(args.work) / "experiments" / (args.p1_from or args.exp) / "oof.parquet")
+    if not args.s1_from:
+        O = pd.read_parquet(Path(args.work) / "experiments" / (args.p1_from or args.exp) / "oof.parquet")
+    else:  # bagged stage 1: average the out-of-fold p1 of several stage-1 runs (same pairs, same folds)
+        exps = args.s1_from.split(",")
+        O = pd.read_parquet(Path(args.work) / "experiments" / exps[0] / "oof.parquet")
+        acc = O["oof"].to_numpy(np.float64)
+        for e in exps[1:]:
+            O2 = pd.read_parquet(Path(args.work) / "experiments" / e / "oof.parquet")
+            assert np.array_equal(O2["s1_idx"].to_numpy(), O["s1_idx"].to_numpy()) and                 np.array_equal(O2["r_idx"].to_numpy(), O["r_idx"].to_numpy()) and                 np.array_equal(O2["fold"].to_numpy(), O["fold"].to_numpy()), f"{e}: different pairs or folds"
+            acc += O2["oof"].to_numpy(np.float64)
+            del O2
+        O["oof"] = (acc / len(exps)).astype(np.float32)
+        log(f"stage 1: out-of-fold p1 averaged over {exps}")
     if args.no_ctx:  # pairs come from the stage-1 source; no candidate table or stage-1 feature cache needed
         s1, s23 = load_prepared(args.data, "train", args.work)
         cand = O[["s1_idx", "r_idx"]].copy()
@@ -562,7 +574,11 @@ def cmd_predict(args):
     if args.p1_from:  # E011: reuse another experiment's stage-1 test probabilities
         models, names = [], []
     else:
-        models = _load_models(out, "model") or [lgb.Booster(model_file=str(out / "model.txt"))]
+        if args.s1_from:  # bagged stage 1: every fold model of every listed run, averaged
+            models = [m for e in args.s1_from.split(",") for m in _load_models(Path(args.work) / "experiments" / e, "model")]
+            assert len({tuple(m.feature_name()) for m in models}) == 1, "stage-1 runs use different features"
+        else:
+            models = _load_models(out, "model") or [lgb.Booster(model_file=str(out / "model.txt"))]
         names = models[0].feature_name()
         log(f"stage 1: {len(models)} model(s), {len(names)} features")
     pc = Path(args.work) / "test" / f"cand_{args.block_tag}.parquet"
@@ -770,6 +786,10 @@ def main():
     ap.add_argument("--no-ctx", action="store_true",
                     help="stack/predict with --p1-from: pairs from that experiment's oof/test probabilities, "
                          "no candidate table (stage-2 features without candidate-table context)")
+    ap.add_argument("--s1-leaves", type=int, default=0, help="stage-1 num_leaves for a bagging variant (0 = 127)")
+    ap.add_argument("--s1-seed", type=int, default=0, help="stage-1 LightGBM seed for a bagging variant")
+    ap.add_argument("--s1-from", default="", help="stack/predict: comma-separated runs whose stage-1 out-of-fold p1 / "
+                                                  "fold models are averaged (bagged stage 1)")
     ap.add_argument("--stack-lr", type=float, default=0.0, help="stage-2 learning rate (0 = --lr)")
     ap.add_argument("--stack-leaves", type=int, default=0, help="stage-2 num_leaves (0 = 127)")
     ap.add_argument("--stack-seeds", type=int, default=1, help="stage-2 models per fold with different seeds, averaged")
@@ -785,6 +805,10 @@ def main():
     ap.add_argument("--cand-from", default="", help="select: symlink candidate_pairs.tsv from this output dir")
     args = ap.parse_args()
     PARAMS["learning_rate"] = args.lr
+    if args.s1_leaves:  # stage-1 variant for bagging (cv only; stack/predict of the bag are separate calls)
+        PARAMS.update(num_leaves=args.s1_leaves, feature_fraction=0.7)
+    if args.s1_seed:
+        PARAMS["seed"] = args.s1_seed
     args.block_tag = block_tag(args)
     if os.environ.get("BER_DENSE_FAKE") and args.dense_model != "none":  # smoke tests: never mix stand-in cosines with real model caches
         args.dense_model = "fake"
