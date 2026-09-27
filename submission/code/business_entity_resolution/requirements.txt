@@ -1,0 +1,15 @@
+# Python 3.11/3.12 (Kaggle notebook image). All packages and models MIT / BSD / Apache-2.0.
+numpy==2.3.1
+pandas==2.3.3
+pyarrow==25.0.1
+scipy==1.16.0
+scikit-learn==1.7.1
+rapidfuzz==3.14.6
+lightgbm==4.7.0
+# GPU steps only (blocking channel bge_native, dense cosines):
+torch>=2.4
+sentence-transformers>=3.0
+# models downloaded from the Hugging Face hub at run time:
+#   BAAI/bge-m3                     (MIT, 568M params)  - native-script retrieval channel in blocking
+#   intfloat/multilingual-e5-small  (MIT, 118M params)  - dense name / name+address cosines (revision 614241f6)
+pytest
